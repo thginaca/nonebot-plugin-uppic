@@ -404,11 +404,12 @@ async def add_pic(event: GroupMessageEvent, matched: Tuple[Any, ...] = RegexGrou
         msg = "\n导入成功！"
         if isOss and command not in uppic_oss_no_upload_list:
             msg += f'可去 {endpoint}/{parse.quote(command)}/ 查看'
-            # StaticImageGalleryGenerator(uppic_img_path, uppic_path / 'public').generate_static_site()
             StaticImageGalleryGenerator(uppic_img_path, uppic_path / 'public').generate_command_html(command, file_name, uppic_oss_no_upload_list)
-            await OSSUploaderV2().upload_file(str(uppic_path/ 'public' / command / 'index.html'), f'{command}/index.html') # 修改index.html文件
+            await OSSUploaderV2().upload_file(str(uppic_path/ 'public' / command / 'index.html'), f'{command}/index.html')
             await OSSUploaderV2().upload_file(str(uppic_path / 'public' / 'index.html'), 'index.html')
-            await OSSUploaderV2().upload_file(file_path, f'{command}/{file_name}') # 上传新增的图片到OSS
+            await OSSUploaderV2().upload_file(file_path, f'{command}/{file_name}')
+        # 无论是否OSS，都刷新本地静态网站
+        regenerate_web_site()
         await add.finish(pic_name + Message(msg), at_sender=True)
 
 OSS = on_fullmatch('上传oss', ignorecase=True, permission=GROUP_ADMIN | GROUP_OWNER, priority=1, block=True, )

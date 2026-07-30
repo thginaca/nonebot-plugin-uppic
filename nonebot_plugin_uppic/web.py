@@ -1,5 +1,6 @@
 import os
 import shutil
+import time
 from pathlib import Path
 
 
@@ -122,7 +123,7 @@ class StaticImageGalleryGenerator:
     <div class="header">
         <h1>📸 图片库</h1>
         <div class="stats">
-            共 ''' + str(len(all_folders)) + ''' 个文件夹
+            共 ''' + str(len(all_folders)) + ''' 个文件夹 · 刷新于 ''' + time.strftime('%Y-%m-%d %H:%M:%S') + '''
         </div>
     </div>
 
@@ -132,10 +133,10 @@ class StaticImageGalleryGenerator:
         for folder_key, folder_info in all_folders.items():
             if folder_key == '':
                 display_name = '根目录'
-                folder_url = './'
+                folder_url = './index.html?t=' + str(int(time.time()))
             else:
                 display_name = folder_key
-                folder_url = f'./{folder_key}/'
+                folder_url = f'./{folder_key}/index.html?t=' + str(int(time.time()))
 
             html += f'''
         <div class="folder-card" onclick="location.href='{folder_url}'">
@@ -277,12 +278,12 @@ class StaticImageGalleryGenerator:
 <body>
     <div class="header">
         <div class="breadcrumb">
-            <a href="../">← 首页</a>
+            <a href="../index.html?t=' + str(int(time.time())) + '">← 首页</a>
             {' / ' + folder_path if folder_path else ''}
         </div>
         <h1>📁 {folder_path if folder_path else '根目录'}</h1>
         <div class="stats">
-            共 {folder_info['image_count']} 张图片
+            共 {folder_info['image_count']} 张图片 · 刷新于 ''' + time.strftime('%Y-%m-%d %H:%M:%S') + '''
         </div>
 '''
 
@@ -293,9 +294,9 @@ class StaticImageGalleryGenerator:
 '''
             for subfolder in folder_info['subfolders']:
                 if folder_path:
-                    subfolder_url = f'./{subfolder}/index.html'
+                    subfolder_url = f'./{subfolder}/index.html?t=' + str(int(time.time()))
                 else:
-                    subfolder_url = f'./{subfolder}/index.html'
+                    subfolder_url = f'./{subfolder}/index.html?t=' + str(int(time.time()))
 
                 html += f'            <a href="{subfolder_url}" class="subfolder-item">{subfolder}</a>\n'
 
@@ -311,6 +312,7 @@ class StaticImageGalleryGenerator:
 
     <script>
         const folderPath = "''' + folder_path + '''";
+        const cacheBuster = ''' + str(int(time.time())) + ''';
         
         function loadImages() {
             const container = document.getElementById('imageContainer');
@@ -323,7 +325,7 @@ class StaticImageGalleryGenerator:
             
             container.innerHTML = '';
             images.forEach(imgName => {
-                const imgUrl = '/uppic/img/' + (folderPath ? folderPath + '/' : '') + imgName;
+                const imgUrl = '/uppic/img/' + (folderPath ? folderPath + '/' : '') + imgName + '?t=' + cacheBuster;
                 const card = document.createElement('div');
                 card.className = 'image-card';
                 card.innerHTML = `
