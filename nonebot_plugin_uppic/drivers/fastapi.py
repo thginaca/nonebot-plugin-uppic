@@ -30,13 +30,13 @@ def init_app_config(img_path: Path, super_users: list, db_connection, no_upload_
 def register_route(driver: Driver, uppic_public_path: Path, uppic_img_path: Path):
     app = driver.server_app
 
+    # 挂载原图目录（必须在 /uppic 之前，否则会被 /uppic 拦截）
+    img_path = str(uppic_img_path.resolve())
+    app.mount("/uppic/img", StaticFiles(directory=img_path), name="uppic_img")
+
     # 挂载HTML静态文件
     html_path = str(uppic_public_path.resolve())
     app.mount("/uppic", StaticFiles(directory=html_path, html=True), name="uppic")
-
-    # 挂载原图目录，让网页直接引用
-    img_path = str(uppic_img_path.resolve())
-    app.mount("/uppic/img", StaticFiles(directory=img_path), name="uppic_img")
 
     @app.post("/uppic/api/delete")
     async def delete_image(req: DeleteRequest):
