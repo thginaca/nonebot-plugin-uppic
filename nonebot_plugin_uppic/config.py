@@ -2,7 +2,7 @@ import json
 import re
 from pathlib import Path
 from pydantic import BaseModel, Extra
-from typing import Dict, List, Optional, Set
+from typing import Any, Dict, List, Optional, Set
 from nonebot import require
 from nonebot import get_driver
 from nonebot.log import logger

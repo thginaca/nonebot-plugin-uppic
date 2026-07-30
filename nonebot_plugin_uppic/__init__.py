@@ -94,7 +94,7 @@ def _can_upload(event: GroupMessageEvent) -> bool:
 
 uppic_filename: str = 'uppic_{command}_{index}'
 
-connection: aiosqlite.Connection
+connection: aiosqlite.Connection = None
 
 # 激活驱动器
 driver = get_driver()
@@ -106,6 +106,7 @@ async def _():
     clear_compress_cache()
     await connect()
     await create_dir()
+    web_app_init(driver)
     logger.info("文件检查完成，欢迎使用！")
 
 @driver.on_shutdown
@@ -253,8 +254,6 @@ def web_app_init(web_driver: Driver):
     logger.opt(colors=True).info(
         f"图片库: <b><u>http://{host}:{port}/uppic/</u></b>"
     )
-
-web_app_init(driver)
 
 
 def regenerate_web_site():
