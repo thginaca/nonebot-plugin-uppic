@@ -1,0 +1,26 @@
+[tool.poetry]
+name = "nonebot-plugin-uppic"
+version = "1.0.0"
+description = "一个通过指令随机发送你存储的图片的nonebot2插件"
+authors = ["thginaca"]
+license = "MIT"
+readme = "README.md"
+packages = [{include = "nonebot_plugin_uppic"}]
+homepage = "https://github.com/yourusername/nonebot-plugin-uppic"
+repository = "https://github.com/yourusername/nonebot-plugin-uppic"
+
+
+[tool.poetry.dependencies]
+python = "^3.8"
+nonebot2 = {version = "^2.0.0", extras = ["fastapi"]}
+nonebot-adapter-onebot = "^2.1.5"
+nonebot-plugin-localstore = ">=0.7.4"
+aiosqlite = ">=0.13.0"
+httpx = ">=0.20.0,<1.0.0"
+alibabacloud_oss_v2 = ">=1.1.0"
+pillow = ">=11.0.0"
+imagehash = ">=4.3.0"
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"
