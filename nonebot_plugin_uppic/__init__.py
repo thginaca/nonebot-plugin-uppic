@@ -1,3 +1,4 @@
+import re
 import time
 import uuid
 from httpx import AsyncClient
@@ -11,6 +12,7 @@ from nonebot.params import Arg, CommandArg, RegexGroup
 from nonebot.rule import Rule, to_me
 from nonebot import get_driver, Driver
 from nonebot.log import logger
+from nonebot.matcher import Matcher
 import hashlib
 import aiosqlite
 from urllib import parse
@@ -20,6 +22,7 @@ import imagehash
 from .config import *
 from .config import save_commands_file, is_commands_file_writable, VALID_COMMAND_PATTERN
 from .config import save_permissions_file, is_permissions_file_writable
+from .config import save_aliases_file, is_aliases_file_writable
 from . import config as _config
 from .ali_oss import *
 from .compress import compress_image_from_bytes, get_image_extension, compute_phash, clear_compress_cache
@@ -39,6 +42,8 @@ __plugin_meta__ = PluginMetadata(
 # 直接引用 config 模块的字典对象，保证插件内的所有修改都能在持久化时被一并写回。
 current_commands_config: Dict[str, Set[int]] = _config.uppic_commands_config
 current_upload_permissions: Dict[int, str] = _config.uppic_upload_permissions
+# 别名配置：{ 别名 -> 原指令名 }
+current_aliases_config: Dict[str, str] = _config.uppic_aliases_config
 uppic_path = Path(uppic_store_dir_path)
 uppic_img_path = uppic_path / 'img'
 uppic_database_path = uppic_path / 'database'
@@ -71,6 +76,29 @@ def _persist_permissions() -> bool:
     return True
 
 
+def _persist_aliases() -> bool:
+    """把当前别名配置全量写回 JSON。"""
+    if not is_aliases_file_writable():
+        logger.warning(
+            f"{_config.ALIASES_FILENAME} 处于损坏状态，跳过本次持久化。"
+            f"别名变更仅在本次会话内生效，重启后会丢失。"
+        )
+        return False
+    save_aliases_file(uppic_store_dir_path, current_aliases_config)
+    return True
+
+
+def _resolve_command(name: str) -> str:
+    """别名解析：把输入名解析为最终原指令名；找不到别名就原样返回。"""
+    if name in current_commands_config:
+        return name
+    return current_aliases_config.get(name, name)
+
+
+def _is_super_user(uid: int) -> bool:
+    return uid in uppic_super_users
+
+
 def _can_upload(event: GroupMessageEvent) -> bool:
     """检查用户是否有权限上传图片。
     
@@ -95,6 +123,9 @@ def _can_upload(event: GroupMessageEvent) -> bool:
 uppic_filename: str = 'uppic_{command}_{index}'
 
 connection: aiosqlite.Connection = None
+
+# 每个指令的"最近发送冷却池"，避免短时间内重复发同一张
+_recent_sent: Dict[str, Set[int]] = {}
 
 # 激活驱动器
 driver = get_driver()
@@ -241,7 +272,7 @@ def web_app_init(web_driver: Driver):
     # 初始化API配置（传入删除后的回调函数）
     init_app_config_fn = getattr(_module, "init_app_config", None)
     if init_app_config_fn:
-        init_app_config_fn(uppic_img_path, uppic_super_users, connection, uppic_oss_no_upload_list, regenerate_web_site)
+        init_app_config_fn(uppic_img_path, uppic_super_users, connection, uppic_oss_no_upload_list, regenerate_web_site, _recent_sent)
     
     # 注册路由（挂载HTML + 原图目录 + API）
     register_route = getattr(_module, "register_route")
@@ -265,12 +296,55 @@ def regenerate_web_site():
         logger.warning(f"重新生成网站失败: {e}")
 
 
+# 单次发图上限（防止刷屏）
+MAX_BATCH_COUNT = 3
+# 匹配 <指令><数字> ，数字可选；例如 czy / czy1 / czy2 / czy3
+_COMMAND_NUM_RE = re.compile(r'^(.+?)([1-9]\d*)?$')
+
+
+def _split_command_and_count(raw_msg: str):
+    """把原始消息拆成 (指令名, 张数)，张数限制在 1~MAX_BATCH_COUNT。
+
+    精确匹配优先：如果 raw_msg 本身就是一个已注册指令或别名，即使末尾带数字也不拆。
+    """
+    if raw_msg in current_commands_config or raw_msg in current_aliases_config:
+        return raw_msg, 1
+
+    m = _COMMAND_NUM_RE.fullmatch(raw_msg)
+    if not m:
+        return raw_msg, 1
+    cmd, num_str = m.group(1), m.group(2)
+    if num_str is None:
+        return cmd, 1
+    try:
+        n = int(num_str)
+    except ValueError:
+        return cmd, 1
+    if n < 1:
+        n = 1
+    if n > MAX_BATCH_COUNT:
+        n = MAX_BATCH_COUNT
+    return cmd, n
+
+
 async def _is_known_command(event: GroupMessageEvent) -> bool:
     msg = str(event.get_message()).strip()
-    disabled = current_commands_config.get(msg)
+    # 精确匹配优先（原指令 + 别名）
+    if msg in current_commands_config:
+        disabled = current_commands_config[msg]
+        return event.group_id not in disabled
+    if msg in current_aliases_config:
+        target = current_aliases_config[msg]
+        disabled = current_commands_config.get(target)
+        if disabled is None:
+            return False
+        return event.group_id not in disabled
+
+    cmd_or_alias, _ = _split_command_and_count(msg)
+    resolved = _resolve_command(cmd_or_alias)
+    disabled = current_commands_config.get(resolved)
     if disabled is None:
         return False
-    # 在本群被禁用：rule 直接不匹配，避免 block=True 拦下其它插件
     return event.group_id not in disabled
 
 
@@ -283,18 +357,79 @@ async def pic(event: GroupMessageEvent):
         return
     global connection
     cursor = await connection.cursor()
-    command = str(event.get_message()).strip()
-    await cursor.execute(f'SELECT img_url FROM Pic_of_{command} ORDER BY RANDOM() limit 1')
-    data = await cursor.fetchone()
-    if data is None:
+    raw_msg = str(event.get_message()).strip()
+    cmd_or_alias, count = _split_command_and_count(raw_msg)
+    command = _resolve_command(cmd_or_alias)
+
+    # 获取该指令的图片总数，决定冷却池大小 + 实际能抽的张数
+    await cursor.execute(f'SELECT COUNT(*) FROM Pic_of_{command}')
+    total = (await cursor.fetchone())[0]
+    if total == 0:
         await picture.finish('当前还没有图片!')
-    file_name = data[0]
-    img = uppic_img_path / file_name
-    try:
-        await picture.send(MessageSegment.image(img))
-    except Exception as e:
-        logger.info(e)
-        await picture.send(f'{command}出不来了，稍后再试试吧~')
+
+    # 实际抽取张数不能超过总张数，也不能超过上限
+    count = min(count, total, MAX_BATCH_COUNT) if total > 0 else 1
+
+    # 冷却池按原指令名记录（别名共享同一份冷却池）
+    cool_size = max(1, total // 2)
+    if command not in _recent_sent:
+        _recent_sent[command] = set()
+    recent = _recent_sent[command]
+
+    selected: List[Tuple[int, str]] = []
+    excluded_ids = list(recent)
+
+    # 先尝试排除冷却池抽取 count 张不重复的
+    if excluded_ids:
+        placeholders = ','.join('?' * len(excluded_ids))
+        await cursor.execute(
+            f'SELECT id, img_url FROM Pic_of_{command} WHERE id NOT IN ({placeholders}) ORDER BY RANDOM() limit ?',
+            [*excluded_ids, count]
+        )
+        rows = await cursor.fetchall()
+        selected.extend(rows)
+
+    # 如果不够 count 张（冷却池占满了或占太多），补齐剩余，必要时允许重复从全体中抽
+    if len(selected) < count:
+        already = {r[0] for r in selected}
+        still_need = count - len(selected)
+        await cursor.execute(
+            f'SELECT id, img_url FROM Pic_of_{command} ORDER BY RANDOM() limit ?',
+            (max(still_need * 2, count),)  # 多抽一些去重
+        )
+        for row in await cursor.fetchall():
+            if row[0] not in already and len(selected) < count:
+                selected.append(row)
+                already.add(row[0])
+        # 如果还不够（图片极少且需要多张），放宽允许重复
+        if len(selected) < count:
+            for row in await cursor.fetchall():
+                if len(selected) < count:
+                    selected.append(row)
+
+    if not selected:
+        await picture.finish('当前还没有图片!')
+
+    # 全部入选 id 加入冷却池，超过大小时踢掉旧的
+    for img_id, _ in selected:
+        recent.add(img_id)
+    while len(recent) > cool_size:
+        recent.pop()
+
+    # 依次发送每张图片
+    fail_cnt = 0
+    for _, file_name in selected:
+        img = uppic_img_path / file_name
+        try:
+            await picture.send(MessageSegment.image(img))
+        except Exception as e:
+            fail_cnt += 1
+            logger.info(e)
+
+    if fail_cnt == len(selected):
+        await picture.send(f'{cmd_or_alias}出不来了，稍后再试试吧~')
+    elif fail_cnt > 0:
+        await picture.send(f'{cmd_or_alias}有{fail_cnt}张出不来，稍后再试试吧~')
 
 
 add = on_regex(r"^添加(.+)$", permission=GROUP, priority=2, block=True)
@@ -319,19 +454,34 @@ async def _ensure_new_command(command: str) -> None:
     logger.info(f"已动态创建新指令分类：{command}")
 
 
+@add.handle()
+async def add_check_reply(matcher: Matcher, event: GroupMessageEvent):
+    """如果用户通过引用回复图片来添加，提前提取图片到 pic 参数，跳过 got 提示。"""
+    # 当前消息已包含图片，走正常流程
+    if any(seg.type == 'image' for seg in event.get_message()):
+        return
+    # 尝试从引用回复中提取图片
+    if event.reply:
+        images = [seg for seg in event.reply.message if seg.type == 'image']
+        if images:
+            matcher.set_arg("pic", Message(images))
+
+
 @add.got("pic", prompt="请发送图片！")
 async def add_pic(event: GroupMessageEvent, matched: Tuple[Any, ...] = RegexGroup(), pic_list: Message = Arg('pic')):
     if not _can_upload(event):
         await add.finish("你没有上传图片的权限！")
     
     global connection
-    command = matched[0].strip()
+    input_name = matched[0].strip()
+    command = _resolve_command(input_name)  # 别名→原指令
 
-    if not VALID_COMMAND_PATTERN.fullmatch(command):
+    if not VALID_COMMAND_PATTERN.fullmatch(input_name):
         await add.finish("名称仅支持字母、汉字和数字，且不能为空！")
 
-    # 若是新指令，先建文件夹与数据表，再续接添加流程
+    # 若目标指令不存在，按输入的原名（非别名）建一个新指令
     if command not in current_commands_config:
+        command = input_name
         try:
             await _ensure_new_command(command)
         except Exception as e:
@@ -408,6 +558,8 @@ async def add_pic(event: GroupMessageEvent, matched: Tuple[Any, ...] = RegexGrou
             await OSSUploaderV2().upload_file(str(uppic_path/ 'public' / command / 'index.html'), f'{command}/index.html')
             await OSSUploaderV2().upload_file(str(uppic_path / 'public' / 'index.html'), 'index.html')
             await OSSUploaderV2().upload_file(file_path, f'{command}/{file_name}')
+        # 新图片入库，清空冷却池让新图能立即参与随机
+        _recent_sent.pop(command, None)
         # 无论是否OSS，都刷新本地静态网站
         regenerate_web_site()
         await add.finish(pic_name + Message(msg), at_sender=True)
@@ -434,19 +586,20 @@ disable = on_command("禁用", rule=to_me(), permission=GROUP_ADMIN | GROUP_OWNE
 
 @disable.handle()
 async def handle_disable(event: GroupMessageEvent, args: Message = CommandArg()) -> None:
-    command = args.extract_plain_text().strip()
-    if not command:
+    input_name = args.extract_plain_text().strip()
+    if not input_name:
         await disable.finish("请指定要禁用的指令名！例如：@bot 禁用 capoo")
-    if not VALID_COMMAND_PATTERN.fullmatch(command):
+    if not VALID_COMMAND_PATTERN.fullmatch(input_name):
         await disable.finish("指令名称仅支持字母、汉字和数字！")
+    command = _resolve_command(input_name)
     if command not in current_commands_config:
-        await disable.finish(f"指令「{command}」不存在！")
+        await disable.finish(f"指令「{input_name}」不存在！")
     gid = event.group_id
     disabled = current_commands_config[command]
     if gid in disabled:
-        await disable.finish(f"指令「{command}」在本群已经是禁用状态。")
+        await disable.finish(f"指令「{input_name}」在本群已经是禁用状态。")
     disabled.add(gid)
-    msg = f"已在本群禁用指令「{command}」。"
+    msg = f"已在本群禁用指令「{input_name}」。"
     if not _persist_commands():
         msg += f"\n⚠️ {_config.COMMANDS_FILENAME} 损坏，本次禁用不会持久化，重启后会丢失。请管理员尽快修复 JSON。"
     await disable.finish(msg)
@@ -457,19 +610,20 @@ enable = on_command("启用", rule=to_me(), permission=GROUP_ADMIN | GROUP_OWNER
 
 @enable.handle()
 async def handle_enable(event: GroupMessageEvent, args: Message = CommandArg()) -> None:
-    command = args.extract_plain_text().strip()
-    if not command:
+    input_name = args.extract_plain_text().strip()
+    if not input_name:
         await enable.finish("请指定要启用的指令名！例如：@bot 启用 capoo")
-    if not VALID_COMMAND_PATTERN.fullmatch(command):
+    if not VALID_COMMAND_PATTERN.fullmatch(input_name):
         await enable.finish("指令名称仅支持字母、汉字和数字！")
+    command = _resolve_command(input_name)
     if command not in current_commands_config:
-        await enable.finish(f"指令「{command}」不存在！")
+        await enable.finish(f"指令「{input_name}」不存在！")
     gid = event.group_id
     disabled = current_commands_config[command]
     if gid not in disabled:
-        await enable.finish(f"指令「{command}」在本群本来就没有被禁用。")
+        await enable.finish(f"指令「{input_name}」在本群本来就没有被禁用。")
     disabled.discard(gid)
-    msg = f"已在本群重新启用指令「{command}」。"
+    msg = f"已在本群重新启用指令「{input_name}」。"
     if not _persist_commands():
         msg += f"\n⚠️ {_config.COMMANDS_FILENAME} 损坏，本次启用不会持久化，重启后会丢失。请管理员尽快修复 JSON。"
     await enable.finish(msg)
@@ -602,25 +756,27 @@ async def _send_image_page(images: List[Dict[str, Any]], page: int):
 
 @delete_pic.handle()
 async def handle_delete_pic(matched: Tuple[Any, ...] = RegexGroup()):
-    command = matched[0].strip()
-    if not VALID_COMMAND_PATTERN.fullmatch(command):
+    input_name = matched[0].strip()
+    if not VALID_COMMAND_PATTERN.fullmatch(input_name):
         await delete_pic.finish("指令名称仅支持字母、汉字和数字！")
+    command = _resolve_command(input_name)
     if command not in current_commands_config:
-        await delete_pic.finish(f"指令「{command}」不存在！")
+        await delete_pic.finish(f"指令「{input_name}」不存在！")
 
     images = await _get_image_list(command)
     if not images:
-        await delete_pic.finish(f"指令「{command}」下没有图片！")
+        await delete_pic.finish(f"指令「{input_name}」下没有图片！")
 
     total_pages = (len(images) + PAGE_SIZE - 1) // PAGE_SIZE
     delete_session_data[id(delete_pic)] = {
         "command": command,
+        "input_name": input_name,
         "images": images,
         "total_pages": total_pages,
         "state": "select_page"
     }
 
-    await delete_pic.send(f"删除图片「{command}」，共 {len(images)} 张图片，共 {total_pages} 页。\n请输入页码（1-{total_pages}），或发送「取消」放弃删除。")
+    await delete_pic.send(f"删除图片「{input_name}」，共 {len(images)} 张图片，共 {total_pages} 页。\n请输入页码（1-{total_pages}），或发送「取消」放弃删除。")
 
 
 @delete_pic.got("input", prompt="请输入页码")
@@ -694,6 +850,11 @@ async def process_delete_input(event: GroupMessageEvent, input_msg: Message = Ar
                 await cursor.execute(f'DELETE FROM Pic_of_{command} WHERE id = ?', (img_id,))
                 await connection.commit()
 
+                # 从冷却池中删除已删 id，避免长期堆积无效数据
+                recent = _recent_sent.get(command)
+                if recent and img_id in recent:
+                    recent.discard(img_id)
+
                 if isOss and command not in uppic_oss_no_upload_list:
                     try:
                         oss_key = f'{command}/{os.path.basename(img_url)}'
@@ -718,3 +879,90 @@ async def process_delete_input(event: GroupMessageEvent, input_msg: Message = Ar
             await delete_pic.finish(msg)
         else:
             await delete_pic.finish("删除失败！")
+
+
+# ====================== 别名管理（仅限超级用户） ======================
+
+# 用法：添加别名 <原指令> <别名>
+add_alias = on_regex(r"^添加别名\s+(.+)$", priority=1, block=True)
+
+
+@add_alias.handle()
+async def handle_add_alias(event: GroupMessageEvent, matched: Tuple[Any, ...] = RegexGroup()):
+    uid = event.user_id
+    if not _is_super_user(uid):
+        await add_alias.finish("只有超级用户可以管理别名！")
+
+    params = matched[0].strip().split()
+    if len(params) != 2:
+        await add_alias.finish("用法：添加别名 <原指令> <别名>\n例如：添加别名 插蒺蒼 czy")
+
+    original, alias = params[0].strip(), params[1].strip()
+
+    if not VALID_COMMAND_PATTERN.fullmatch(original):
+        await add_alias.finish(f"原指令「{original}」非法，仅支持字母、汉字、数字！")
+    if not VALID_COMMAND_PATTERN.fullmatch(alias):
+        await add_alias.finish(f"别名「{alias}」非法，仅支持字母、汉字、数字！")
+
+    if original not in current_commands_config:
+        await add_alias.finish(f"原指令「{original}」不存在！请先通过「添加{original}」创建该指令。")
+
+    # 冲突检查：别名不能与已注册指令名相同
+    if alias in current_commands_config:
+        await add_alias.finish(f"别名「{alias}」与已存在的指令名冲突，请换一个。")
+
+    # 覆盖写入：同一别名重复设置时，更新到最新原指令
+    current_aliases_config[alias] = original
+    msg = f"别名设置成功：「{alias}」 → 「{original}」"
+    if not _persist_aliases():
+        msg += f"\n⚠️ {_config.ALIASES_FILENAME} 损坏，本次设置不会持久化，重启后会丢失。"
+    await add_alias.finish(msg)
+
+
+# 用法：删除别名 <别名>
+remove_alias = on_regex(r"^删除别名\s+(.+)$", priority=1, block=True)
+
+
+@remove_alias.handle()
+async def handle_remove_alias(event: GroupMessageEvent, matched: Tuple[Any, ...] = RegexGroup()):
+    uid = event.user_id
+    if not _is_super_user(uid):
+        await remove_alias.finish("只有超级用户可以管理别名！")
+
+    alias = matched[0].strip()
+    if not VALID_COMMAND_PATTERN.fullmatch(alias):
+        await remove_alias.finish("别名非法，仅支持字母、汉字、数字！")
+
+    if alias not in current_aliases_config:
+        await remove_alias.finish(f"别名「{alias}」不存在！")
+
+    target = current_aliases_config.pop(alias)
+    msg = f"已删除别名：「{alias}」 → 「{target}」"
+    if not _persist_aliases():
+        msg += f"\n⚠️ {_config.ALIASES_FILENAME} 损坏，本次删除不会持久化。"
+    await remove_alias.finish(msg)
+
+
+# 用法：别名列表
+list_alias = on_fullmatch("别名列表", ignorecase=True, priority=1, block=True)
+
+
+@list_alias.handle()
+async def handle_list_alias(event: GroupMessageEvent):
+    uid = event.user_id
+    if not _is_super_user(uid):
+        await list_alias.finish("只有超级用户可以查看别名列表！")
+
+    if not current_aliases_config:
+        await list_alias.finish("当前没有设置任何别名。")
+
+    lines = [f"共 {len(current_aliases_config)} 个别名："]
+    # 按原指令分组展示，方便管理
+    grouped: Dict[str, List[str]] = {}
+    for alias, target in current_aliases_config.items():
+        grouped.setdefault(target, []).append(alias)
+    for target, aliases in sorted(grouped.items()):
+        aliases_str = "、".join(sorted(aliases))
+        lines.append(f"「{target}」← {aliases_str}")
+
+    await list_alias.finish("\n".join(lines))

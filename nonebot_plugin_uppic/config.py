@@ -26,12 +26,14 @@ class Config(BaseModel, extra='ignore'):
 
 COMMANDS_FILENAME = 'uppic_commands.json'
 PERMISSIONS_FILENAME = 'uppic_permissions.json'
+ALIASES_FILENAME = 'uppic_aliases.json'
 DEFAULT_COMMANDS: List[str] = ["capoo"]
 
 VALID_COMMAND_PATTERN = re.compile(r"^[A-Za-z0-9一-龥]+$")
 
 commands_file_corrupted: bool = False
 permissions_file_corrupted: bool = False
+aliases_file_corrupted: bool = False
 
 
 def is_commands_file_writable() -> bool:
@@ -42,12 +44,20 @@ def is_permissions_file_writable() -> bool:
     return not permissions_file_corrupted
 
 
+def is_aliases_file_writable() -> bool:
+    return not aliases_file_corrupted
+
+
 def commands_file_path(store_dir: str) -> Path:
     return Path(store_dir) / COMMANDS_FILENAME
 
 
 def permissions_file_path(store_dir: str) -> Path:
     return Path(store_dir) / PERMISSIONS_FILENAME
+
+
+def aliases_file_path(store_dir: str) -> Path:
+    return Path(store_dir) / ALIASES_FILENAME
 
 
 def load_commands_file(store_dir: str) -> Dict[str, Set[int]]:
@@ -225,6 +235,65 @@ def save_permissions_file(store_dir: str, permissions: Dict[int, Dict[str, Any]]
         json.dump(serializable, f, ensure_ascii=False, indent=2)
 
 
+def load_aliases_file(store_dir: str) -> Dict[str, str]:
+    """读取别名配置 JSON。返回「别名 -> 原指令名」映射。
+
+    - 别名和原指令名都必须匹配 VALID_COMMAND_PATTERN
+    - 原指令名必须已经存在于指令配置中（否则跳过告警）
+    - 别名不能与任何已注册指令名相同（避免冲突，跳过告警）
+    """
+    global aliases_file_corrupted
+    path = aliases_file_path(store_dir)
+    if not path.exists():
+        logger.info(f"未找到 {path}，使用空别名配置")
+        return {}
+    try:
+        with path.open('r', encoding='utf-8') as f:
+            data = json.load(f)
+    except Exception as e:
+        aliases_file_corrupted = True
+        logger.error(
+            f"读取 {path} 失败（JSON 格式错误）：{e}；本次启动以空别名列表运行，"
+            f"且运行时不会写回此文件以避免覆盖。请修复后重启 bot。"
+        )
+        return {}
+
+    if not isinstance(data, dict):
+        aliases_file_corrupted = True
+        logger.error(
+            f"{path} 顶层必须是 dict，得到 {type(data).__name__}；本次启动以空别名列表运行"
+        )
+        return {}
+
+    result: Dict[str, str] = {}
+    for alias, target in data.items():
+        if not isinstance(alias, str) or not isinstance(target, str):
+            logger.warning(f"{path} 中忽略非字符串条目: {alias!r} -> {target!r}")
+            continue
+        alias = alias.strip()
+        target = target.strip()
+        if not alias or not target:
+            logger.warning(f"{path} 中忽略空字符串条目: {alias!r} -> {target!r}")
+            continue
+        if not VALID_COMMAND_PATTERN.fullmatch(alias):
+            logger.warning(f"{path} 中忽略非法别名 {alias!r}（仅允许字母、汉字、数字）")
+            continue
+        if not VALID_COMMAND_PATTERN.fullmatch(target):
+            logger.warning(f"{path} 中别名 {alias!r} 的目标指令 {target!r} 非法，已跳过")
+            continue
+        result[alias] = target
+    return result
+
+
+def save_aliases_file(store_dir: str, aliases: Dict[str, str]) -> None:
+    """全量覆盖写入别名配置 JSON。注意：调用方应先检查 is_aliases_file_writable()。"""
+    path = aliases_file_path(store_dir)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    serializable = {k: v for k, v in sorted(aliases.items())}
+    with path.open('w', encoding='utf-8') as f:
+        json.dump(serializable, f, ensure_ascii=False, indent=2)
+
+
 config_dict = Config.model_validate(get_driver().config.dict())
 uppic_store_dir_path: str = config_dict.uppic_store_dir_path
 uppic_banner_group = config_dict.uppic_banner_group
@@ -234,6 +303,9 @@ uppic_banner_group = config_dict.uppic_banner_group
 uppic_commands_config: Dict[str, Set[int]] = load_commands_file(uppic_store_dir_path)
 # 仅作快照，保留旧名以兼容外部引用；运行期请通过 uppic_commands_config 取最新键集合。
 uppic_command_list: List[str] = list(uppic_commands_config.keys())
+
+# 别名配置：{ 别名 -> 原指令名 }
+uppic_aliases_config: Dict[str, str] = load_aliases_file(uppic_store_dir_path)
 
 uppic_endpoint = config_dict.uppic_endpoint
 uppic_bucket = config_dict.uppic_bucket

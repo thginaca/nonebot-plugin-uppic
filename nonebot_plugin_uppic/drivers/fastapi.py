@@ -12,6 +12,7 @@ from nonebot.drivers.fastapi import Driver
 _img_path: Optional[Path] = None
 _db_connection = None
 _on_delete_callback: Optional[Callable] = None
+_recent_sent_ref = None  # 冷却池引用
 
 
 class DeleteRequest(BaseModel):
@@ -19,12 +20,13 @@ class DeleteRequest(BaseModel):
     filename: str
 
 
-def init_app_config(img_path: Path, super_users: list, db_connection, no_upload_list: list, on_delete_callback: Callable = None):
+def init_app_config(img_path: Path, super_users: list, db_connection, no_upload_list: list, on_delete_callback: Callable = None, recent_sent=None):
     """初始化应用配置，供API使用"""
-    global _img_path, _db_connection, _on_delete_callback
+    global _img_path, _db_connection, _on_delete_callback, _recent_sent_ref
     _img_path = img_path
     _db_connection = db_connection
     _on_delete_callback = on_delete_callback
+    _recent_sent_ref = recent_sent
 
 
 def register_route(driver: Driver, uppic_public_path: Path, uppic_img_path: Path):
@@ -77,6 +79,13 @@ def register_route(driver: Driver, uppic_public_path: Path, uppic_img_path: Path
                     (rel_path,)
                 )
                 await _db_connection.commit()
+            except Exception:
+                pass
+
+        # 清空该指令的冷却池（避免保留已删除 id）
+        if command and _recent_sent_ref is not None:
+            try:
+                _recent_sent_ref.pop(command, None)
             except Exception:
                 pass
 
