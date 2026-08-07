@@ -164,7 +164,51 @@ def _quantize_gif_frames(frames, n_colors):
 
 
 def _compress_static_bytes(image_bytes, max_size_mb=1, target_quality=85):
-    """压缩静态图片（JPEG/PNG 等），转为 JPEG 输出。"""
+    """压缩静态图片（JPEG/PNG/单帧GIF 等），保持原格式输出。"""
+    image_stream = io.BytesIO(image_bytes)
+    with Image.open(image_stream) as img:
+        fmt = img.format or 'PNG'
+        original_size = img.size
+        has_alpha = img.mode in ('RGBA', 'LA', 'PA')
+
+        # PNG 或带透明通道：保持 PNG 格式
+        if fmt.upper() == 'PNG' or has_alpha:
+            # PNG 无损压缩：尝试降低颜色数或使用优化
+            if max(img.size) > 1920:
+                scale = 1920 / max(img.size)
+                new_size = tuple(int(dim * scale) for dim in img.size)
+                img = img.resize(new_size, Image.Resampling.LANCZOS)
+                logger.info(f"  - 调整尺寸: {original_size} -> {img.size}")
+
+            # 尝试量化减少颜色（保留 PNG 格式）
+            if img.mode == 'RGBA':
+                # 分离 alpha 通道，对 RGB 量化再合并
+                r, g, b, a = img.split()
+                rgb = Image.merge('RGB', (r, g, b))
+                rgb_q = rgb.quantize(colors=256, method=Image.Quantize.MEDIANCUT)
+                rgb_back = rgb_q.convert('RGB')
+                r2, g2, b2 = rgb_back.split()
+                img = Image.merge('RGBA', (r2, g2, b2, a))
+            elif img.mode in ('RGB', 'P'):
+                if img.mode == 'P':
+                    img = img.convert('RGB')
+                img = img.quantize(colors=256, method=Image.Quantize.MEDIANCUT)
+
+            out = io.BytesIO()
+            img.save(out, format='PNG', optimize=True)
+            result = out.getvalue()
+
+            # 如果仍然超过限制且没有透明通道，退化为 JPEG
+            if len(result) / (1024 * 1024) > max_size_mb and not has_alpha:
+                return _compress_to_jpeg(image_bytes, max_size_mb, target_quality)
+            return result
+
+        # JPEG / 无透明通道的静态图：按质量二分压缩
+        return _compress_to_jpeg(image_bytes, max_size_mb, target_quality)
+
+
+def _compress_to_jpeg(image_bytes, max_size_mb=1, target_quality=85):
+    """将静态图片转为 JPEG 并压缩到目标大小。"""
     image_stream = io.BytesIO(image_bytes)
     with Image.open(image_stream) as img:
         original_size = img.size
@@ -219,17 +263,27 @@ def _compress_static_bytes(image_bytes, max_size_mb=1, target_quality=85):
 def adaptive_compress_bytes(image_bytes, max_size_mb=1, target_quality=85, skip_cache=False):
     """
     自适应压缩，确保压缩后的大小不超过限制。
-    动态 GIF 保持 GIF 格式输出，静态图片转为 JPEG 输出。
-    
-    参数:
-        image_bytes: 图片字节流
-        max_size_mb: 最大大小限制(MB)
-        target_quality: 目标质量（仅用于静态图）
-        skip_cache: 是否跳过缓存检查（用于强制压缩）
+    - 动态 GIF：跳过压缩，直接保存原图（避免颜色损坏/动画错乱）
+    - 静态图片：按格式智能压缩
     """
     original_size_mb = len(image_bytes) / (1024 * 1024)
 
-    if original_size_mb <= max_size_mb:
+    # 检查图片类型：GIF 动画直接跳过压缩（压缩会破坏颜色和帧）
+    try:
+        with Image.open(io.BytesIO(image_bytes)) as img:
+            fmt = img.format
+            is_animated = getattr(img, 'n_frames', 1) > 1
+    except Exception:
+        # 无法识别格式，跳过压缩
+        logger.warning("无法识别图片格式，跳过压缩")
+        return image_bytes
+
+    if fmt == 'GIF' and is_animated:
+        if original_size_mb > max_size_mb:
+            logger.info(
+                f"GIF 动图大小 {original_size_mb:.2f}MB 超过 {max_size_mb}MB 限制，"
+                f"但为避免颜色损坏仍保留原图"
+            )
         return image_bytes
 
     # 检查缓存：如果已经压缩过，直接返回
@@ -243,15 +297,7 @@ def adaptive_compress_bytes(image_bytes, max_size_mb=1, target_quality=85, skip_
 
     logger.info(f"图片大小: {original_size_mb:.2f}MB，超过限制 {max_size_mb}MB，开始自适应压缩...")
 
-    image_stream = io.BytesIO(image_bytes)
-    with Image.open(image_stream) as img:
-        fmt = img.format
-        is_animated = getattr(img, 'n_frames', 1) > 1
-
-    if fmt == 'GIF' and is_animated:
-        result = _compress_gif_bytes(image_bytes, max_size_mb)
-    else:
-        result = _compress_static_bytes(image_bytes, max_size_mb, target_quality)
+    result = _compress_static_bytes(image_bytes, max_size_mb, target_quality)
 
     # 写入缓存
     if not skip_cache:
@@ -286,13 +332,17 @@ def clear_compress_cache():
 
 
 def get_image_extension(image_bytes):
-    """根据压缩后的字节内容返回正确的文件扩展名，避免依赖来源 URL 的扩展名"""
+    """根据图片格式返回正确的文件扩展名"""
     try:
         with Image.open(io.BytesIO(image_bytes)) as img:
             fmt = img.format
-            is_animated = getattr(img, 'n_frames', 1) > 1
-        if fmt == 'GIF' and is_animated:
+        if fmt == 'GIF':
             return '.gif'
+        if fmt == 'PNG':
+            return '.png'
+        if fmt == 'JPEG':
+            return '.jpg'
+        # 其他格式统一用 .jpg
         return '.jpg'
     except Exception as e:
         logger.warning(f"获取图片扩展名失败: {e}，使用默认扩展名 .jpg")
