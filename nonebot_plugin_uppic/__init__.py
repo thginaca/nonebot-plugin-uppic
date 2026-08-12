@@ -3,7 +3,6 @@ import re
 import time
 import uuid
 from httpx import AsyncClient
-import ssl
 from typing import Any, Dict, List, Set, Tuple
 from nonebot.adapters.onebot.v11 import MessageSegment, Message, GroupMessageEvent
 from nonebot.adapters.onebot.v11 import GROUP, GROUP_ADMIN, GROUP_OWNER
@@ -529,20 +528,40 @@ async def add_pic(event: GroupMessageEvent, matched: Tuple[Any, ...] = RegexGrou
         if pic_name.type != 'image':
             await add.send(MessageSegment.text("\n输入格式有误，请重新触发指令！"), at_sender=True)
             continue
-        pic_url = pic_name.data['url']
-
-        ssl_context = ssl.create_default_context()
-        ssl_context.set_ciphers("DEFAULT")
-        try:
-            async with AsyncClient(verify=ssl_context) as client:
-                resp = await client.get(pic_url, timeout=5.0)
-            resp.raise_for_status()
-        except Exception as e:
-            logger.warning(f"下载图片失败: {e}")
-            await add.send(MessageSegment.text('\n保存出错了，这张请重试'))
+        pic_url = pic_name.data.get('url', '')
+        if not pic_url:
+            logger.warning("图片消息缺少 url 字段，跳过")
+            await add.send(MessageSegment.text('\n这张图片无法获取，跳过了'))
             continue
 
-        data = resp.content
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            "Referer": "https://qpic.cn/",
+            "Accept": "image/*,*/*",
+        }
+        data = None
+        try:
+            async with AsyncClient(verify=True, timeout=15.0) as client:
+                resp = await client.get(pic_url, headers=headers)
+                resp.raise_for_status()
+                data = resp.content
+        except Exception as e:
+            logger.warning(f"下载图片失败(尝试1): {e}")
+            try:
+                async with AsyncClient(verify=False, timeout=15.0) as client:
+                    resp = await client.get(pic_url, headers=headers)
+                    resp.raise_for_status()
+                    data = resp.content
+                    logger.info("图片下载成功(重试)")
+            except Exception as e2:
+                logger.warning(f"下载图片失败(重试): {e2}")
+                await add.send(MessageSegment.text('\n保存出错了，这张请重试'))
+                continue
+
+        if not data or len(data) < 50:
+            logger.warning(f"下载的图片数据异常，跳过 (大小: {len(data) if data else 0})")
+            await add.send(MessageSegment.text('\n这张图片下载异常，跳过了'))
+            continue
         data = compress_image_from_bytes(data)  # 若图片超规格，压缩图片
         new_phash_str = compute_phash(data)
 
