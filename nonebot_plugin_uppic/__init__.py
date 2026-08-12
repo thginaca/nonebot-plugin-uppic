@@ -1,3 +1,4 @@
+import os
 import re
 import time
 import uuid
@@ -416,15 +417,45 @@ async def pic(event: GroupMessageEvent):
     while len(recent) > cool_size:
         recent.pop()
 
-    # 依次发送每张图片
+    # 依次发送每张图片（先验证文件存在，不存在则跳过并清理数据库记录）
     fail_cnt = 0
-    for _, file_name in selected:
-        img = uppic_img_path / file_name
+    missing_ids: List[int] = []
+    for img_id, file_name in selected:
+        file_path = str((uppic_img_path / file_name).resolve())
+        if not os.path.isfile(file_path):
+            fail_cnt += 1
+            missing_ids.append(img_id)
+            logger.warning(f"图片文件不存在，跳过发送: {file_name} (id={img_id})")
+            continue
+        if os.path.getsize(file_path) < 100:
+            fail_cnt += 1
+            missing_ids.append(img_id)
+            logger.warning(f"图片文件过小（可能损坏），跳过: {file_name}")
+            continue
         try:
-            await picture.send(MessageSegment.image(img))
+            # 使用 file= 关键字参数明确告诉 NoneBot 这是本地文件，
+            # 避免被误判为 URL（sub_type=0）导致 OneBot 去下载失败
+            await picture.send(MessageSegment.image(file=file_path))
         except Exception as e:
             fail_cnt += 1
-            logger.info(e)
+            logger.warning(f"发送图片失败 {file_name}: {e}")
+
+    # 清理丢失的图片的数据库记录，避免后续继续抽到
+    if missing_ids:
+        try:
+            cursor = await connection.cursor()
+            placeholders = ','.join('?' * len(missing_ids))
+            await cursor.execute(
+                f'DELETE FROM Pic_of_{command} WHERE id IN ({placeholders})',
+                missing_ids
+            )
+            await connection.commit()
+            logger.info(f"已清理 {len(missing_ids)} 条丢失图片的数据库记录")
+            # 从冷却池移除
+            if command in _recent_sent:
+                _recent_sent[command] = _recent_sent[command] - set(missing_ids)
+        except Exception as e:
+            logger.error(f"清理丢失记录失败: {e}")
 
     if fail_cnt == len(selected):
         await picture.send(f'{cmd_or_alias}出不来了，稍后再试试吧~')
@@ -496,46 +527,47 @@ async def add_pic(event: GroupMessageEvent, matched: Tuple[Any, ...] = RegexGrou
 
     for pic_name in pic_list:
         if pic_name.type != 'image':
-            await add.send(pic_name + MessageSegment.text("\n输入格式有误，请重新触发指令！"), at_sender=True)
+            await add.send(MessageSegment.text("\n输入格式有误，请重新触发指令！"), at_sender=True)
             continue
         pic_url = pic_name.data['url']
 
         ssl_context = ssl.create_default_context()
         ssl_context.set_ciphers("DEFAULT")
-        async with AsyncClient(verify=ssl_context) as client:
-            resp = await client.get(pic_url, timeout=5.0)
-
         try:
+            async with AsyncClient(verify=ssl_context) as client:
+                resp = await client.get(pic_url, timeout=5.0)
             resp.raise_for_status()
         except Exception as e:
-            logger.warning(e)
-            await add.send(
-                pic_name +
-                MessageSegment.text('\n保存出错了，这张请重试')
-            )
+            logger.warning(f"下载图片失败: {e}")
+            await add.send(MessageSegment.text('\n保存出错了，这张请重试'))
             continue
 
         data = resp.content
         data = compress_image_from_bytes(data)  # 若图片超规格，压缩图片
         new_phash_str = compute_phash(data)
 
+        # 去重检查（仅记录，不阻断保存；相似图会标记但仍保存）
+        is_duplicate = False
         if new_phash_str:
             try:
                 new_phash = imagehash.hex_to_hash(new_phash_str)
                 await cursor.execute(f'SELECT phash FROM Pic_of_{command}')
                 existing = await cursor.fetchall()
-                SIMILARITY_THRESHOLD = 5  # 汉明距离 ≤5 认为相似
+                SIMILARITY_THRESHOLD = 5
                 for ex_phash_str, in existing:
                     if ex_phash_str:
                         try:
                             ex_phash = imagehash.hex_to_hash(ex_phash_str)
                             if (new_phash - ex_phash) < SIMILARITY_THRESHOLD:
-                                await add.finish(pic_name + Message('\n这张已经有相似图，不能重复添加！'))
+                                is_duplicate = True
+                                logger.info("检测到相似图，仍允许保存（以新图为准）")
+                                break
                         except Exception:
                             continue
             except Exception as e:
                 logger.warning(f"图片去重检查失败: {e}，跳过去重")
 
+        # 先保存文件和数据库，确保即使后续发送失败，图片也已入库
         uppic_cur_picnum = len(os.listdir(uppic_img_path / command))
         file_name = (uppic_filename.format(command=command, index=str(uppic_cur_picnum + 1).zfill(10))
                     + get_image_extension(data))
@@ -549,20 +581,25 @@ async def add_pic(event: GroupMessageEvent, matched: Tuple[Any, ...] = RegexGrou
             await connection.commit()
         except Exception as e:
             logger.warning(e)
-            await add.finish(pic_name + Message("\n导入失败！"), at_sender=True)
+            await add.send(MessageSegment.text("\n导入失败！"), at_sender=True)
+            continue
 
-        msg = "\n导入成功！"
-        if isOss and command not in uppic_oss_no_upload_list:
-            msg += f'可去 {endpoint}/{parse.quote(command)}/ 查看'
-            StaticImageGalleryGenerator(uppic_img_path, uppic_path / 'public').generate_command_html(command, file_name, uppic_oss_no_upload_list)
-            await OSSUploaderV2().upload_file(str(uppic_path/ 'public' / command / 'index.html'), f'{command}/index.html')
-            await OSSUploaderV2().upload_file(str(uppic_path / 'public' / 'index.html'), 'index.html')
-            await OSSUploaderV2().upload_file(file_path, f'{command}/{file_name}')
-        # 新图片入库，清空冷却池让新图能立即参与随机
-        _recent_sent.pop(command, None)
-        # 无论是否OSS，都刷新本地静态网站
-        regenerate_web_site()
-        await add.finish(pic_name + Message(msg), at_sender=True)
+        # 保存成功后再发送提示
+        try:
+            msg = "\n导入成功！"
+            if is_duplicate:
+                msg += "（与已有图片相似，仍已保存）"
+            if isOss and command not in uppic_oss_no_upload_list:
+                msg += f'可去 {endpoint}/{parse.quote(command)}/ 查看'
+                StaticImageGalleryGenerator(uppic_img_path, uppic_path / 'public').generate_command_html(command, file_name, uppic_oss_no_upload_list)
+                await OSSUploaderV2().upload_file(str(uppic_path/ 'public' / command / 'index.html'), f'{command}/index.html')
+                await OSSUploaderV2().upload_file(str(uppic_path / 'public' / 'index.html'), 'index.html')
+                await OSSUploaderV2().upload_file(file_path, f'{command}/{file_name}')
+            _recent_sent.pop(command, None)
+            regenerate_web_site()
+            await add.send(MessageSegment.text(msg), at_sender=True)
+        except Exception as e:
+            logger.warning(f"发送确认消息失败（但图片已保存）: {e}")
 
 OSS = on_fullmatch('上传oss', ignorecase=True, permission=GROUP_ADMIN | GROUP_OWNER, priority=1, block=True, )
 @OSS.handle()
@@ -746,8 +783,8 @@ async def _send_image_page(images: List[Dict[str, Any]], page: int):
     await delete_pic.send(f"=== 第 {page} 页 / 共 {total_pages} 页 ===")
 
     for i, img in enumerate(page_images, start + 1):
-        file_path = uppic_img_path / img["img_url"]
-        if file_path.exists():
+        file_path = str((uppic_img_path / img["img_url"]).resolve())
+        if os.path.exists(file_path):
             await delete_pic.send(f"序号 {i}:")
             await delete_pic.send(MessageSegment.image(file_path))
         else:

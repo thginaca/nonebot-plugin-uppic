@@ -1,0 +1,27 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# Virtual environments
+venv/
+env/
+.venv/
+
+# IDE
+.vscode/
+.idea/
+
+# Runtime data
+data.db
+public/
+
+# OS
+Thumbs.db
+.DS_Store
+
+# Distribution
+dist/
+build/
+*.egg-info/

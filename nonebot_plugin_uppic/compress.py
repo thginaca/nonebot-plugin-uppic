@@ -286,6 +286,11 @@ def adaptive_compress_bytes(image_bytes, max_size_mb=1, target_quality=85, skip_
             )
         return image_bytes
 
+    # 已符合大小要求的小图直接返回，避免无意义压缩/膨胀
+    if original_size_mb <= max_size_mb:
+        logger.debug(f"图片大小 {original_size_mb:.2f}MB 未超过 {max_size_mb}MB，跳过压缩")
+        return image_bytes
+
     # 检查缓存：如果已经压缩过，直接返回
     if not skip_cache:
         img_hash = _get_bytes_hash(image_bytes)
