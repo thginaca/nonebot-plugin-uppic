@@ -543,24 +543,26 @@ async def add_pic(bot: Bot, event: GroupMessageEvent, matched: Tuple[Any, ...] =
                 img_info = await bot.get_image(file=file_id)
                 logger.debug(f"get_image 返回: {img_info}")
                 if isinstance(img_info, dict):
-                    # 尝试读取本地缓存文件
                     local_path = img_info.get('file') or img_info.get('filename') or ''
-                    # 处理 file:// 前缀
                     if local_path.startswith('file://'):
                         local_path = local_path[7:]
-                    if local_path and os.path.isfile(local_path):
-                        with open(local_path, 'rb') as f:
-                            data = f.read()
-                        logger.info(f"通过 get_image 本地缓存获取图片: {len(data)} bytes")
+                    # 直接尝试 open 读取，不依赖 isfile（可能因权限问题返回 False）
+                    if local_path:
+                        try:
+                            with open(local_path, 'rb') as f:
+                                data = f.read()
+                            logger.info(f"通过 get_image 本地缓存获取图片: {len(data)} bytes")
+                        except Exception as read_err:
+                            logger.debug(f"本地文件读取失败: {local_path}, 原因: {read_err}")
                     # 尝试 base64 数据
-                    elif img_info.get('base64'):
+                    if not data and img_info.get('base64'):
                         import base64
                         data = base64.b64decode(img_info['base64'])
                         logger.info(f"通过 get_image base64 获取图片: {len(data)} bytes")
                     # 如果返回了新 URL，用它下载
-                    elif img_info.get('url') and img_info['url'] != pic_url:
+                    if not data and img_info.get('url'):
                         pic_url = img_info['url']
-                        logger.info(f"get_image 返回新 URL")
+                        logger.debug(f"使用 get_image 返回的 URL 下载")
             except Exception as e:
                 logger.debug(f"get_image API 失败: {e}")
 
