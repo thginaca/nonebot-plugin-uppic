@@ -4,7 +4,7 @@ import time
 import uuid
 from httpx import AsyncClient
 from typing import Any, Dict, List, Set, Tuple
-from nonebot.adapters.onebot.v11 import MessageSegment, Message, GroupMessageEvent
+from nonebot.adapters.onebot.v11 import MessageSegment, Message, GroupMessageEvent, Bot
 from nonebot.adapters.onebot.v11 import GROUP, GROUP_ADMIN, GROUP_OWNER
 from nonebot.plugin import on_command, on_message, on_regex, on_fullmatch
 from nonebot.plugin import PluginMetadata
@@ -498,7 +498,7 @@ async def add_check_reply(matcher: Matcher, event: GroupMessageEvent):
 
 
 @add.got("pic", prompt="请发送图片！")
-async def add_pic(event: GroupMessageEvent, matched: Tuple[Any, ...] = RegexGroup(), pic_list: Message = Arg('pic')):
+async def add_pic(bot: Bot, event: GroupMessageEvent, matched: Tuple[Any, ...] = RegexGroup(), pic_list: Message = Arg('pic')):
     if not _can_upload(event):
         await add.finish("你没有上传图片的权限！")
     
@@ -529,38 +529,56 @@ async def add_pic(event: GroupMessageEvent, matched: Tuple[Any, ...] = RegexGrou
             await add.send(MessageSegment.text("\n输入格式有误，请重新触发指令！"), at_sender=True)
             continue
         pic_url = pic_name.data.get('url', '')
-        if not pic_url:
-            logger.warning("图片消息缺少 url 字段，跳过")
+        file_id = pic_name.data.get('file', '')
+        if not pic_url and not file_id:
+            logger.warning("图片消息缺少 url 和 file 字段，跳过")
             await add.send(MessageSegment.text('\n这张图片无法获取，跳过了'))
             continue
 
-        headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-            "Referer": "https://qpic.cn/",
-            "Accept": "image/*,*/*",
-        }
         data = None
-        try:
-            async with AsyncClient(verify=True, timeout=15.0) as client:
-                resp = await client.get(pic_url, headers=headers)
-                resp.raise_for_status()
-                data = resp.content
-        except Exception as e:
-            logger.warning(f"下载图片失败(尝试1): {e}")
+
+        # 方案1: 通过 OneBot get_image API 下载（NapCat/Lagrange 用自身 QQ 会话下载，不受 URL 过期影响）
+        if file_id:
             try:
-                async with AsyncClient(verify=False, timeout=15.0) as client:
+                img_info = await bot.get_image(file=file_id)
+                if isinstance(img_info, dict):
+                    local_path = img_info.get('file') or img_info.get('filename')
+                    if local_path and os.path.isfile(local_path):
+                        with open(local_path, 'rb') as f:
+                            data = f.read()
+                        logger.info(f"通过 get_image API 获取图片成功: {len(data)} bytes")
+                    elif img_info.get('url'):
+                        # get_image 返回了新 URL，用它重试
+                        pic_url = img_info['url']
+            except Exception as e:
+                logger.debug(f"get_image API 不可用或失败: {e}")
+
+        # 方案2: httpx 直接下载 URL（带浏览器请求头）
+        if not data and pic_url:
+            headers = {
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+                "Referer": "https://qpic.cn/",
+                "Accept": "image/*,*/*",
+            }
+            try:
+                async with AsyncClient(verify=True, timeout=15.0, follow_redirects=True) as client:
                     resp = await client.get(pic_url, headers=headers)
                     resp.raise_for_status()
                     data = resp.content
-                    logger.info("图片下载成功(重试)")
-            except Exception as e2:
-                logger.warning(f"下载图片失败(重试): {e2}")
-                await add.send(MessageSegment.text('\n保存出错了，这张请重试'))
-                continue
+            except Exception as e:
+                logger.warning(f"下载图片失败(尝试1): {e}")
+                try:
+                    async with AsyncClient(verify=False, timeout=15.0, follow_redirects=True) as client:
+                        resp = await client.get(pic_url, headers=headers)
+                        resp.raise_for_status()
+                        data = resp.content
+                        logger.info("图片下载成功(重试)")
+                except Exception as e2:
+                    logger.warning(f"下载图片失败(重试): {e2}")
 
         if not data or len(data) < 50:
-            logger.warning(f"下载的图片数据异常，跳过 (大小: {len(data) if data else 0})")
-            await add.send(MessageSegment.text('\n这张图片下载异常，跳过了'))
+            logger.warning(f"图片下载失败，跳过 (大小: {len(data) if data else 0})")
+            await add.send(MessageSegment.text('\n图片下载失败（URL可能已过期），请直接发送图片或重新引用最新消息'))
             continue
         data = compress_image_from_bytes(data)  # 若图片超规格，压缩图片
         new_phash_str = compute_phash(data)
