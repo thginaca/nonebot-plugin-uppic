@@ -536,6 +536,7 @@ async def add_pic(bot: Bot, event: GroupMessageEvent, matched: Tuple[Any, ...] =
             continue
 
         data = None
+        import base64 as _b64
 
         # 方案1: 通过 OneBot get_image API 获取本地缓存图片
         if file_id:
@@ -546,25 +547,42 @@ async def add_pic(bot: Bot, event: GroupMessageEvent, matched: Tuple[Any, ...] =
                     local_path = img_info.get('file') or img_info.get('filename') or ''
                     if local_path.startswith('file://'):
                         local_path = local_path[7:]
-                    # 直接尝试 open 读取，不依赖 isfile（可能因权限问题返回 False）
+                    # 尝试直接读取本地缓存文件
                     if local_path:
                         try:
                             with open(local_path, 'rb') as f:
                                 data = f.read()
-                            logger.info(f"通过 get_image 本地缓存获取图片: {len(data)} bytes")
+                            logger.info(f"通过本地缓存获取图片: {len(data)} bytes")
                         except Exception as read_err:
-                            logger.debug(f"本地文件读取失败: {local_path}, 原因: {read_err}")
-                    # 尝试 base64 数据
+                            logger.debug(f"本地文件读取失败: {read_err}")
+                    # 尝试 base64 字段
                     if not data and img_info.get('base64'):
-                        import base64
-                        data = base64.b64decode(img_info['base64'])
-                        logger.info(f"通过 get_image base64 获取图片: {len(data)} bytes")
-                    # 如果返回了新 URL，用它下载
+                        data = _b64.b64decode(img_info['base64'])
+                        logger.info(f"通过 base64 获取图片: {len(data)} bytes")
+                    # 使用 get_image 返回的 URL
                     if not data and img_info.get('url'):
                         pic_url = img_info['url']
-                        logger.debug(f"使用 get_image 返回的 URL 下载")
             except Exception as e:
                 logger.debug(f"get_image API 失败: {e}")
+
+        # 方案1.5: 通过 NapCat get_file API 获取 base64（绕过文件权限问题）
+        if not data and file_id:
+            try:
+                file_info = await bot.call_api("get_file", file=file_id)
+                logger.debug(f"get_file 返回: {file_info}")
+                if isinstance(file_info, dict):
+                    if file_info.get('base64'):
+                        data = _b64.b64decode(file_info['base64'])
+                        logger.info(f"通过 get_file base64 获取图片: {len(data)} bytes")
+                    elif file_info.get('file'):
+                        try:
+                            with open(file_info['file'], 'rb') as f:
+                                data = f.read()
+                            logger.info(f"通过 get_file 本地路径获取图片: {len(data)} bytes")
+                        except Exception:
+                            pass
+            except Exception as e:
+                logger.debug(f"get_file API 失败: {e}")
 
         # 方案2: httpx 直接下载 URL（带浏览器请求头）
         if not data and pic_url:
@@ -589,35 +607,27 @@ async def add_pic(bot: Bot, event: GroupMessageEvent, matched: Tuple[Any, ...] =
                 except Exception as e2:
                     logger.warning(f"下载图片失败(重试): {e2}")
 
-        # 方案3: 通过 bot 转发图片到自身，获取新 URL 后下载
+        # 方案3: 通过 sudo cat 读取 NapCat 缓存文件（权限不足时的兜底）
         if not data and file_id:
             try:
-                # 用 file_id 发送图片给自身，触发 NapCat 重新下载
-                forward_msg = MessageSegment.image(file=file_id)
-                send_result = await bot.send_msg(
-                    user_id=event.user_id,
-                    message=forward_msg
-                )
-                # 获取刚发送的消息，提取新 URL
-                if send_result and send_result.get('message_id'):
-                    sent_msg = await bot.get_msg(message_id=send_result['message_id'])
-                    for seg in sent_msg.get('message', []):
-                        if seg.get('type') == 'image':
-                            new_url = seg.get('data', {}).get('url', '')
-                            if new_url and new_url != pic_url:
-                                pic_url = new_url
-                                logger.info("通过转发获取新 URL，重试下载")
-                                async with AsyncClient(verify=True, timeout=15.0, follow_redirects=True) as client:
-                                    resp = await client.get(pic_url, headers=headers)
-                                    resp.raise_for_status()
-                                    data = resp.content
-                                break
+                img_info2 = await bot.get_image(file=file_id)
+                lp = (img_info2 or {}).get('file', '') if isinstance(img_info2, dict) else ''
+                if lp:
+                    import subprocess
+                    result = subprocess.run(['sudo', 'cat', lp], capture_output=True, timeout=10)
+                    if result.returncode == 0 and len(result.stdout) > 50:
+                        data = result.stdout
+                        logger.info(f"通过 sudo cat 获取图片: {len(data)} bytes")
             except Exception as e:
-                logger.debug(f"转发获取图片失败: {e}")
+                logger.debug(f"sudo cat 读取失败: {e}")
 
         if not data or len(data) < 50:
             logger.warning(f"图片下载失败，跳过 (大小: {len(data) if data else 0})")
-            await add.send(MessageSegment.text('\n图片下载失败（URL可能已过期），请直接发送图片而非引用旧消息'))
+            await add.send(MessageSegment.text(
+                '\n图片获取失败！可能是：\n'
+                '1. 图片URL已过期（引用了旧消息）→ 请直接发送图片\n'
+                '2. NapCat缓存文件权限不足 → 请将NoneBot以root运行，或执行: chmod -R 755 /root/.config/QQ/'
+            ))
             continue
         data = compress_image_from_bytes(data)  # 若图片超规格，压缩图片
         new_phash_str = compute_phash(data)
