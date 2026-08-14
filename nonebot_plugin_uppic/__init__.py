@@ -1089,3 +1089,98 @@ async def handle_list_alias(event: GroupMessageEvent):
         lines.append(f"「{target}」← {aliases_str}")
 
     await list_alias.finish("\n".join(lines))
+
+
+# ====================== 删除分类（仅限超级用户） ======================
+
+# 用法：删除分类 <指令名>
+delete_category = on_regex(r"^删除分类\s+(.+)$", priority=1, block=True)
+
+
+@delete_category.handle()
+async def handle_delete_category(event: GroupMessageEvent, matched: Tuple[Any, ...] = RegexGroup()):
+    uid = event.user_id
+    if not _is_super_user(uid):
+        await delete_category.finish("只有超级用户可以删除分类！")
+
+    input_name = matched[0].strip()
+    if not VALID_COMMAND_PATTERN.fullmatch(input_name):
+        await delete_category.finish("指令名称仅支持字母、汉字和数字！")
+
+    command = _resolve_command(input_name)
+    if command not in current_commands_config:
+        await delete_category.finish(f"指令「{input_name}」不存在！")
+
+    # 二次确认
+    folder_path = uppic_img_path / command
+    img_count = 0
+    if folder_path.exists():
+        img_count = len([f for f in os.listdir(folder_path) if f != '.gitkeep'])
+
+    delete_category.set_arg("confirm_target", command)
+    await delete_category.send(
+        f"即将删除分类「{command}」：\n"
+        f"  - 文件夹：{folder_path}\n"
+        f"  - 图片数量：{img_count}\n"
+        f"  - 数据库表：Pic_of_{command}\n"
+        f"  - 相关别名也会一并清除\n\n"
+        f"确认删除请发送「确认」，发送其他内容取消。"
+    )
+
+
+@delete_category.got("confirm")
+async def confirm_delete_category(event: GroupMessageEvent, confirm: Message = Arg('confirm')):
+    command = delete_category.get_arg("confirm_target")
+    if command is None:
+        await delete_category.finish("会话已过期，请重新触发删除指令！")
+
+    text = confirm.extract_plain_text().strip()
+    if text != "确认":
+        await delete_category.finish(f"已取消删除分类「{command}」。")
+
+    # 1. 删除文件夹及内部文件
+    folder_path = uppic_img_path / command
+    deleted_files = 0
+    if folder_path.exists():
+        import shutil
+        for f in os.listdir(folder_path):
+            file_full = folder_path / f
+            if file_full.is_file():
+                file_full.unlink()
+                deleted_files += 1
+        shutil.rmtree(folder_path, ignore_errors=True)
+        logger.info(f"已删除文件夹: {folder_path} ({deleted_files} 个文件)")
+
+    # 2. 删除数据库表和快照记录
+    cursor = await connection.cursor()
+    await cursor.execute(f'DROP TABLE IF EXISTS Pic_of_{command}')
+    await cursor.execute('DELETE FROM folder_snapshot WHERE command = ?', (command,))
+    await connection.commit()
+    logger.info(f"已删除数据库表: Pic_of_{command}")
+
+    # 3. 从指令配置中移除
+    current_commands_config.pop(command, None)
+    _persist_commands()
+
+    # 4. 删除所有指向该指令的别名
+    removed_aliases = [a for a, t in current_aliases_config.items() if t == command]
+    for a in removed_aliases:
+        current_aliases_config.pop(a, None)
+    if removed_aliases:
+        _persist_aliases()
+
+    # 5. 从冷却池中清除
+    for key in list(_recent_sent.keys()):
+        if key == command or _resolve_command(key) == command:
+            _recent_sent.pop(key, None)
+
+    # 6. 重新生成网页
+    try:
+        StaticImageGalleryGenerator(uppic_img_path, uppic_path / 'public').generate_static_site(uppic_oss_no_upload_list)
+    except Exception as e:
+        logger.warning(f"重新生成网页失败: {e}")
+
+    msg = f"分类「{command}」已删除！\n  - 删除文件：{deleted_files} 个\n  - 删除别名：{len(removed_aliases)} 个"
+    if removed_aliases:
+        msg += f"（{'、'.join(removed_aliases)}）"
+    await delete_category.finish(msg)
