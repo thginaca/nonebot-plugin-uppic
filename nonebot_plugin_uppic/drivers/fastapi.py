@@ -3,6 +3,7 @@ from pathlib import Path
 from typing import Optional, Callable
 
 from fastapi.staticfiles import StaticFiles
+from fastapi import UploadFile, File, Form
 from pydantic import BaseModel
 
 from nonebot.drivers.fastapi import Driver
@@ -13,6 +14,7 @@ _img_path: Optional[Path] = None
 _db_connection = None
 _on_delete_callback: Optional[Callable] = None
 _on_delete_folder_callback: Optional[Callable] = None  # async callback
+_on_upload_callback: Optional[Callable] = None  # async callback
 _recent_sent_ref = None  # 冷却池引用
 
 
@@ -25,13 +27,14 @@ class DeleteFolderRequest(BaseModel):
     folder: str
 
 
-def init_app_config(img_path: Path, super_users: list, db_connection, no_upload_list: list, on_delete_callback: Callable = None, recent_sent=None, on_delete_folder_callback: Callable = None):
+def init_app_config(img_path: Path, super_users: list, db_connection, no_upload_list: list, on_delete_callback: Callable = None, recent_sent=None, on_delete_folder_callback: Callable = None, on_upload_callback: Callable = None):
     """初始化应用配置，供API使用"""
-    global _img_path, _db_connection, _on_delete_callback, _on_delete_folder_callback, _recent_sent_ref
+    global _img_path, _db_connection, _on_delete_callback, _on_delete_folder_callback, _on_upload_callback, _recent_sent_ref
     _img_path = img_path
     _db_connection = db_connection
     _on_delete_callback = on_delete_callback
     _on_delete_folder_callback = on_delete_folder_callback
+    _on_upload_callback = on_upload_callback
     _recent_sent_ref = recent_sent
 
 
@@ -151,6 +154,35 @@ def register_route(driver: Driver, uppic_public_path: Path, uppic_img_path: Path
                 return {"success": True, "message": f"文件夹已删除，但清理失败: {e}"}
 
         return {"success": True, "message": f"已删除分类「{folder}」，共 {deleted_files} 个文件"}
+
+    @app.post("/uppic/api/upload")
+    async def upload_image(folder: str = Form(...), file: UploadFile = File(...)):
+        """网页端上传图片到指定分类"""
+        if _on_upload_callback is None:
+            return {"success": False, "message": "服务未初始化"}
+
+        # 安全检查
+        if not folder or '/' in folder or '\\' in folder or '..' in folder:
+            return {"success": False, "message": "非法文件夹名"}
+
+        # 读取文件数据
+        file_data = await file.read()
+        if not file_data or len(file_data) < 50:
+            return {"success": False, "message": "文件为空或太小"}
+
+        # 检查文件类型
+        allowed_types = {'image/jpeg', 'image/png', 'image/gif', 'image/bmp', 'image/webp', 'image/tiff'}
+        if file.content_type and file.content_type not in allowed_types:
+            # 也通过扩展名检查
+            ext = os.path.splitext(file.filename or '')[1].lower()
+            if ext not in {'.jpg', '.jpeg', '.png', '.gif', '.bmp', '.webp', '.tiff', '.svg'}:
+                return {"success": False, "message": f"不支持的文件类型: {file.content_type or ext}"}
+
+        try:
+            result = await _on_upload_callback(folder, file_data)
+            return result
+        except Exception as e:
+            return {"success": False, "message": f"上传失败: {e}"}
 
     # 挂载原图目录
     img_path = str(uppic_img_path.resolve())

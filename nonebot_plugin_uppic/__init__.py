@@ -272,7 +272,7 @@ def web_app_init(web_driver: Driver):
     # 初始化API配置（传入删除后的回调函数）
     init_app_config_fn = getattr(_module, "init_app_config", None)
     if init_app_config_fn:
-        init_app_config_fn(uppic_img_path, uppic_super_users, connection, uppic_oss_no_upload_list, regenerate_web_site, _recent_sent, delete_folder_cleanup)
+        init_app_config_fn(uppic_img_path, uppic_super_users, connection, uppic_oss_no_upload_list, regenerate_web_site, _recent_sent, delete_folder_cleanup, upload_image_callback)
     
     # 注册路由（挂载HTML + 原图目录 + API）
     register_route = getattr(_module, "register_route")
@@ -324,6 +324,66 @@ async def delete_folder_cleanup(command: str):
     # 5. 重新生成网页
     regenerate_web_site()
     logger.info(f"分类「{command}」清理完成，删除别名: {removed_aliases}")
+
+
+async def upload_image_callback(folder: str, file_data: bytes) -> dict:
+    """网页端上传图片回调：压缩+去重+保存+入库+刷新网页"""
+    command = folder
+    if command not in current_commands_config:
+        return {"success": False, "message": f"分类「{command}」不存在"}
+
+    # 压缩
+    data = compress_image_from_bytes(file_data)
+    new_phash_str = compute_phash(data)
+
+    # 去重检查
+    is_duplicate = False
+    if new_phash_str:
+        try:
+            cursor = await connection.cursor()
+            new_phash = imagehash.hex_to_hash(new_phash_str)
+            await cursor.execute(f'SELECT phash FROM Pic_of_{command}')
+            existing = await cursor.fetchall()
+            for ex_phash_str, in existing:
+                if ex_phash_str:
+                    try:
+                        ex_phash = imagehash.hex_to_hash(ex_phash_str)
+                        if (new_phash - ex_phash) < 5:
+                            is_duplicate = True
+                            break
+                    except Exception:
+                        continue
+        except Exception as e:
+            logger.warning(f"网页上传去重检查失败: {e}")
+
+    # 保存文件
+    uppic_cur_picnum = len(os.listdir(uppic_img_path / command))
+    file_name = (uppic_filename.format(command=command, index=str(uppic_cur_picnum + 1).zfill(10))
+                + get_image_extension(data))
+    file_path = uppic_img_path / command / file_name
+
+    try:
+        with file_path.open("wb") as f:
+            f.write(data)
+        cursor = await connection.cursor()
+        await cursor.execute(
+            'insert into Pic_of_{command}(img_url, phash) values (?, ?)'.format(command=command),
+            (str(Path() / command / file_name), new_phash_str)
+        )
+        await connection.commit()
+    except Exception as e:
+        logger.warning(f"网页上传保存失败: {e}")
+        return {"success": False, "message": f"保存失败: {e}"}
+
+    # 刷新网页
+    _recent_sent.pop(command, None)
+    regenerate_web_site()
+
+    msg = "上传成功"
+    if is_duplicate:
+        msg += "（与已有图片相似，仍已保存）"
+    logger.info(f"网页上传图片到「{command}」: {file_name} ({len(data)} bytes)")
+    return {"success": True, "message": msg, "filename": file_name}
 
 
 # 单次发图上限（防止刷屏）

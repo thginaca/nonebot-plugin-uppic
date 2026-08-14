@@ -317,6 +317,67 @@ class StaticImageGalleryGenerator:
         .subfolder-item:hover {{
             background: #138496;
         }}
+        .upload-zone {{
+            max-width: 1200px;
+            margin: 20px auto;
+            padding: 30px;
+            border: 3px dashed #ccc;
+            border-radius: 10px;
+            text-align: center;
+            background: #fafafa;
+            transition: border-color 0.3s, background 0.3s;
+            cursor: pointer;
+        }}
+        .upload-zone.dragover {{
+            border-color: #007bff;
+            background: #e7f1ff;
+        }}
+        .upload-zone p {{
+            margin: 5px 0;
+            color: #666;
+        }}
+        .upload-btn {{
+            display: inline-block;
+            padding: 10px 24px;
+            background: #007bff;
+            color: white;
+            border: none;
+            border-radius: 5px;
+            cursor: pointer;
+            font-size: 14px;
+            margin-top: 10px;
+        }}
+        .upload-btn:hover {{
+            background: #0056b3;
+        }}
+        .upload-status {{
+            max-width: 1200px;
+            margin: 10px auto;
+            text-align: center;
+        }}
+        .upload-status .success {{
+            color: #28a745;
+        }}
+        .upload-status .error {{
+            color: #dc3545;
+        }}
+        .upload-progress {{
+            display: inline-block;
+            margin: 5px;
+            padding: 3px 10px;
+            background: #e9ecef;
+            border-radius: 3px;
+            font-size: 12px;
+            color: #666;
+        }}
+        .upload-progress.done {{
+            background: #d4edda;
+            color: #155724;
+        }}
+        .upload-progress.fail {{
+            background: #f8d7da;
+            color: #721c24;
+        }}
     </style>
 </head>
 <body>
@@ -349,7 +410,21 @@ class StaticImageGalleryGenerator:
 
         html += '''
     </div>
+'''
 
+        # 上传区域（仅非根目录时显示）
+        if folder_path:
+            html += '''
+    <div class="upload-zone" id="uploadZone">
+        <p>📎 拖拽图片到此处上传，或点击选择文件</p>
+        <p style="font-size:12px;color:#999;">支持 JPG / PNG / GIF / BMP / WEBP，可多选</p>
+        <input type="file" id="fileInput" multiple accept="image/*" style="display:none;">
+        <button class="upload-btn" onclick="document.getElementById('fileInput').click()">选择图片</button>
+    </div>
+    <div class="upload-status" id="uploadStatus"></div>
+'''
+
+        html += '''
     <div id="imageContainer" class="image-container">
         <div style="grid-column: 1/-1; text-align: center; padding: 40px; color: #666;">加载中...</div>
     </div>
@@ -418,6 +493,89 @@ class StaticImageGalleryGenerator:
         }
         
         loadImages();
+
+        // ===== 拖拽上传 =====
+        const uploadZone = document.getElementById('uploadZone');
+        const fileInput = document.getElementById('fileInput');
+        const uploadStatus = document.getElementById('uploadStatus');
+
+        if (uploadZone && fileInput) {
+            // 点击上传区域触发文件选择
+            uploadZone.addEventListener('click', function(e) {
+                if (e.target.tagName !== 'BUTTON') fileInput.click();
+            });
+
+            // 拖拽事件
+            uploadZone.addEventListener('dragover', function(e) {
+                e.preventDefault();
+                uploadZone.classList.add('dragover');
+            });
+            uploadZone.addEventListener('dragleave', function(e) {
+                uploadZone.classList.remove('dragover');
+            });
+            uploadZone.addEventListener('drop', function(e) {
+                e.preventDefault();
+                uploadZone.classList.remove('dragover');
+                handleFiles(e.dataTransfer.files);
+            });
+
+            // 文件选择
+            fileInput.addEventListener('change', function() {
+                handleFiles(this.files);
+                this.value = '';
+            });
+
+            function handleFiles(files) {
+                if (!files || files.length === 0) return;
+                let imgFiles = Array.from(files).filter(f => f.type.startsWith('image/'));
+                if (imgFiles.length === 0) {
+                    alert('请选择图片文件！');
+                    return;
+                }
+                uploadStatus.innerHTML = '<p>正在上传 ' + imgFiles.length + ' 张图片...</p>';
+                let results = [];
+                let completed = 0;
+
+                imgFiles.forEach((file, idx) => {
+                    let tag = document.createElement('span');
+                    tag.className = 'upload-progress';
+                    tag.textContent = file.name;
+                    uploadStatus.appendChild(tag);
+
+                    let formData = new FormData();
+                    formData.append('folder', folderPath);
+                    formData.append('file', file);
+
+                    fetch('/uppic/api/upload', {
+                        method: 'POST',
+                        body: formData
+                    })
+                    .then(r => r.json())
+                    .then(data => {
+                        tag.classList.add(data.success ? 'done' : 'fail');
+                        tag.textContent = file.name + (data.success ? ' ✓' : ' ✗');
+                        results.push(data.success);
+                        completed++;
+                        if (completed === imgFiles.length) {
+                            let ok = results.filter(r => r).length;
+                            let fail = results.length - ok;
+                            let msg = '上传完成：成功 ' + ok + ' 张';
+                            if (fail > 0) msg += '，失败 ' + fail + ' 张';
+                            uploadStatus.innerHTML = '<p class="' + (fail === 0 ? 'success' : 'error') + '">' + msg + '</p>';
+                            if (ok > 0) setTimeout(() => location.reload(), 1500);
+                        }
+                    })
+                    .catch(err => {
+                        tag.classList.add('fail');
+                        tag.textContent = file.name + ' ✗';
+                        completed++;
+                        if (completed === imgFiles.length) {
+                            uploadStatus.innerHTML = '<p class="error">上传出错: ' + err + '</p>';
+                        }
+                    });
+                });
+            }
+        }
     </script>
 </body>
 </html>'''
