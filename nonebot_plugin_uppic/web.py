@@ -30,7 +30,7 @@ class StaticImageGalleryGenerator:
                     if Path(filename).suffix.lower() in self.supported_formats:
                         image_files.append(filename)
 
-                if image_files:
+                if image_files or folder_key:
                     result[folder_key] = {
                         'path': rel_path,
                         'images': sorted(image_files),
@@ -112,21 +112,6 @@ class StaticImageGalleryGenerator:
         .folder-link:hover {
             background: #0056b3;
         }
-        .folder-delete-btn {
-            display: inline-block;
-            padding: 8px 16px;
-            background: #dc3545;
-            color: white;
-            border: none;
-            border-radius: 5px;
-            cursor: pointer;
-            font-size: 14px;
-            margin-left: 10px;
-            transition: background 0.3s;
-        }
-        .folder-delete-btn:hover {
-            background: #c82333;
-        }
         .stats {
             text-align: center;
             margin-bottom: 20px;
@@ -153,46 +138,18 @@ class StaticImageGalleryGenerator:
                 display_name = folder_key
                 folder_url = f'./{folder_key}/index.html?t=' + str(int(time.time()))
 
+            empty_label = ' (空)' if folder_info['image_count'] == 0 else ''
             html += f'''
         <div class="folder-card" onclick="location.href='{folder_url}'">
             <div class="folder-icon">📁</div>
-            <div class="folder-name">{display_name}</div>
+            <div class="folder-name">{display_name}{empty_label}</div>
             <div class="folder-stats">{folder_info['image_count']} 张图片</div>
             <span class="folder-link">查看图片</span>
-'''
-            if folder_key:
-                html += f'''
-            <button class="folder-delete-btn" onclick="deleteFolder('{folder_key}', event)">删除分类</button>
-'''
-            html += '''
         </div>
 '''
 
         html += '''
     </div>
-    <script>
-        function deleteFolder(folderName, event) {
-            event.stopPropagation();
-            if (!confirm('确定要删除分类「' + folderName + '」吗？\\n这将删除该分类下的所有图片和数据库记录，不可恢复！')) {
-                return;
-            }
-            fetch('/uppic/api/delete_folder', {
-                method: 'POST',
-                headers: {'Content-Type': 'application/json'},
-                body: JSON.stringify({folder: folderName})
-            })
-            .then(r => r.json())
-            .then(data => {
-                if (data.success) {
-                    alert(data.message);
-                    location.reload();
-                } else {
-                    alert('删除失败: ' + data.message);
-                }
-            })
-            .catch(err => alert('请求失败: ' + err));
-        }
-    </script>
 </body>
 </html>'''
 
@@ -378,6 +335,18 @@ class StaticImageGalleryGenerator:
             background: #f8d7da;
             color: #721c24;
         }}
+        .delete-folder-btn {{
+            padding: 10px 24px;
+            background: #dc3545;
+            color: white;
+            border: none;
+            border-radius: 5px;
+            cursor: pointer;
+            font-size: 14px;
+        }}
+        .delete-folder-btn:hover {{
+            background: #c82333;
+        }}
     </style>
 </head>
 <body>
@@ -422,6 +391,14 @@ class StaticImageGalleryGenerator:
         <button class="upload-btn" onclick="document.getElementById('fileInput').click()">选择图片</button>
     </div>
     <div class="upload-status" id="uploadStatus"></div>
+'''
+            # 空文件夹时显示删除分类按钮
+            if folder_info['image_count'] == 0:
+                html += '''
+    <div style="max-width:1200px;margin:20px auto;text-align:center;">
+        <p style="color:#999;font-size:13px;">该分类下暂无图片，可以删除此分类</p>
+        <button class="delete-folder-btn" onclick="deleteFolder()">🗑️ 删除此分类</button>
+    </div>
 '''
 
         html += '''
@@ -575,6 +552,27 @@ class StaticImageGalleryGenerator:
                     });
                 });
             }
+        }
+
+        function deleteFolder() {
+            if (!confirm('确定要删除分类「' + folderPath + '」吗？\\n这将删除该文件夹和数据库记录，不可恢复！')) {
+                return;
+            }
+            fetch('/uppic/api/delete_folder', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({folder: folderPath})
+            })
+            .then(r => r.json())
+            .then(data => {
+                if (data.success) {
+                    alert(data.message);
+                    window.location.href = '../index.html?t=' + Date.now();
+                } else {
+                    alert('删除失败: ' + data.message);
+                }
+            })
+            .catch(err => alert('请求失败: ' + err));
         }
     </script>
 </body>
