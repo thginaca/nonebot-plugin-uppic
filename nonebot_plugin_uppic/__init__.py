@@ -272,7 +272,7 @@ def web_app_init(web_driver: Driver):
     # 初始化API配置（传入删除后的回调函数）
     init_app_config_fn = getattr(_module, "init_app_config", None)
     if init_app_config_fn:
-        init_app_config_fn(uppic_img_path, uppic_super_users, connection, uppic_oss_no_upload_list, regenerate_web_site, _recent_sent)
+        init_app_config_fn(uppic_img_path, uppic_super_users, connection, uppic_oss_no_upload_list, regenerate_web_site, _recent_sent, delete_folder_cleanup)
     
     # 注册路由（挂载HTML + 原图目录 + API）
     register_route = getattr(_module, "register_route")
@@ -294,6 +294,36 @@ def regenerate_web_site():
         generator.generate_static_site(uppic_oss_no_upload_list)
     except Exception as e:
         logger.warning(f"重新生成网站失败: {e}")
+
+
+async def delete_folder_cleanup(command: str):
+    """网页端删除分类后的清理回调：数据库+配置+别名+冷却池+网页"""
+    # 1. 删除数据库表和快照
+    cursor = await connection.cursor()
+    await cursor.execute(f'DROP TABLE IF EXISTS Pic_of_{command}')
+    await cursor.execute('DELETE FROM folder_snapshot WHERE command = ?', (command,))
+    await connection.commit()
+    logger.info(f"已删除数据库表: Pic_of_{command}")
+
+    # 2. 从指令配置中移除
+    current_commands_config.pop(command, None)
+    _persist_commands()
+
+    # 3. 删除关联别名
+    removed_aliases = [a for a, t in current_aliases_config.items() if t == command]
+    for a in removed_aliases:
+        current_aliases_config.pop(a, None)
+    if removed_aliases:
+        _persist_aliases()
+
+    # 4. 清除冷却池
+    for key in list(_recent_sent.keys()):
+        if key == command or _resolve_command(key) == command:
+            _recent_sent.pop(key, None)
+
+    # 5. 重新生成网页
+    regenerate_web_site()
+    logger.info(f"分类「{command}」清理完成，删除别名: {removed_aliases}")
 
 
 # 单次发图上限（防止刷屏）
