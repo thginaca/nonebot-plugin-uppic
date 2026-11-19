@@ -1461,7 +1461,7 @@ async def confirm_delete_category(event: GroupMessageEvent, confirm: Message = A
 
 # ====================== roll 功能 ======================
 
-roll_cmd = on_regex(r"^(?:/)?roll\s+(.+)$", permission=lambda e: True, priority=5, block=True)
+roll_cmd = on_regex(r"^(?:/)?roll\s+(.+)$", priority=5, block=True)
 
 
 @roll_cmd.handle()
