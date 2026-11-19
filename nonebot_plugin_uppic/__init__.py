@@ -401,8 +401,13 @@ def web_app_init(web_driver: Driver):
         _module = importlib.import_module(
             f"nonebot_plugin_uppic.drivers.{driver.type.split('+')[0]}"
         )
-    except ImportError:
-        logger.warning(f"Driver {driver.type} not supported")
+    except ImportError as e:
+        logger.warning(
+            f"Driver {driver.type} not supported: {e}；"
+            f"如果 pip 装的是旧版本，请 pip install -U nonebot-plugin-uppic，"
+            f"或检查 drivers/{driver.type.split('+')[0]}.py 是否存在",
+            exc_info=True
+        )
         return
     
     # 生成静态网站（只生成HTML，不复制图片）
