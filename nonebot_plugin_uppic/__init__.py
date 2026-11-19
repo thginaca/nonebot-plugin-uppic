@@ -5,7 +5,7 @@ import uuid
 import random
 from httpx import AsyncClient
 from typing import Any, Dict, List, Set, Tuple
-from nonebot.adapters.onebot.v11 import MessageSegment, Message, GroupMessageEvent, Bot
+from nonebot.adapters.onebot.v11 import MessageSegment, Message, GroupMessageEvent, Bot, Event
 from nonebot.adapters.onebot.v11 import GROUP, GROUP_ADMIN, GROUP_OWNER
 from nonebot.plugin import on_command, on_message, on_regex, on_fullmatch
 from nonebot.plugin import PluginMetadata
@@ -1461,11 +1461,11 @@ async def confirm_delete_category(event: GroupMessageEvent, confirm: Message = A
 
 # ====================== roll 功能 ======================
 
-roll_cmd = on_command("roll", permission=GROUP, priority=5, block=True)
+roll_cmd = on_command("roll", permission=lambda e: True, priority=5, block=True, command_start={"", "/"})
 
 
 @roll_cmd.handle()
-async def handle_roll(event: GroupMessageEvent, args: Message = CommandArg()):
+async def handle_roll(event: Event, args: Message = CommandArg()):
     """roll 选项1 选项2 ...  —— 随机返回其中一个"""
     raw = args.extract_plain_text().strip()
     if not raw:
