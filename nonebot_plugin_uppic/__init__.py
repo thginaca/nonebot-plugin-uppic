@@ -1461,13 +1461,13 @@ async def confirm_delete_category(event: GroupMessageEvent, confirm: Message = A
 
 # ====================== roll 功能 ======================
 
-roll_cmd = on_command("roll", permission=lambda e: True, priority=5, block=True, command_start={"", "/"})
+roll_cmd = on_regex(r"^(?:/)?roll\s+(.+)$", permission=lambda e: True, priority=5, block=True)
 
 
 @roll_cmd.handle()
-async def handle_roll(event: Event, args: Message = CommandArg()):
+async def handle_roll(event: Event, matched=RegexGroup()):
     """roll 选项1 选项2 ...  —— 随机返回其中一个"""
-    raw = args.extract_plain_text().strip()
+    raw = (matched or "").strip()
     if not raw:
         await roll_cmd.finish("用法：roll 选项1 选项2 选项3 ...")
 
