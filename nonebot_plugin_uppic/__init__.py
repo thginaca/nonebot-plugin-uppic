@@ -397,33 +397,54 @@ async def _startup_cleanup():
 
 def web_app_init(web_driver: Driver):
     global connection
+    logger.info(f"[Web] 开始初始化, driver={driver.type}, uppic_path={uppic_path}")
+
+    # 1. 检查 img 目录
+    if not uppic_img_path.exists():
+        logger.warning(f"[Web] 图片目录不存在: {uppic_img_path}，创建空目录")
+        uppic_img_path.mkdir(parents=True, exist_ok=True)
+
+    # 2. 导入 drivers.fastapi 模块
+    driver_name = driver.type.split('+')[0]
     try:
-        _module = importlib.import_module(
-            f"nonebot_plugin_uppic.drivers.{driver.type.split('+')[0]}"
-        )
+        _module = importlib.import_module(f"nonebot_plugin_uppic.drivers.{driver_name}")
+        logger.info(f"[Web] drivers.{driver_name} 导入成功: {_module.__file__}")
     except ImportError as e:
         logger.warning(
-            f"Driver {driver.type} not supported: {e}；"
-            f"如果 pip 装的是旧版本，请 pip install -U nonebot-plugin-uppic，"
-            f"或检查 drivers/{driver.type.split('+')[0]}.py 是否存在",
+            f"[Web] Driver {driver.type} 不支持: {e}；"
+            f"请检查 drivers/{driver_name}.py 是否存在，"
+            f"或运行 pip install -U --force-reinstall nonebot-plugin-uppic",
             exc_info=True
         )
         return
-    
-    # 生成静态网站（只生成HTML，不复制图片）
-    StaticImageGalleryGenerator(uppic_img_path, uppic_path / 'public').generate_static_site(uppic_oss_no_upload_list)
-    if not os.path.exists(uppic_path / 'public'):
+
+    # 3. 生成静态网站
+    try:
+        generator = StaticImageGalleryGenerator(uppic_img_path, uppic_path / 'public')
+        generator.generate_static_site(uppic_oss_no_upload_list)
+        logger.info(f"[Web] 静态网站已生成到 {uppic_path / 'public'}")
+    except Exception as e:
+        logger.error(f"[Web] 生成静态网站失败: {e}", exc_info=True)
         return
-    
-    # 初始化API配置（传入删除后的回调函数）
+
+    public_dir = uppic_path / 'public'
+    index_html = public_dir / 'index.html'
+    if not index_html.exists():
+        logger.error(f"[Web] 生成后 index.html 仍不存在: {index_html}")
+        return
+    logger.info(f"[Web] index.html 存在, 大小={index_html.stat().st_size} bytes")
+
+    # 4. 初始化 API 配置
     init_app_config_fn = getattr(_module, "init_app_config", None)
     if init_app_config_fn:
         init_app_config_fn(uppic_img_path, uppic_super_users, connection, uppic_oss_no_upload_list, regenerate_web_site, _recent_sent, delete_folder_cleanup, upload_image_callback)
-    
-    # 注册路由（挂载HTML + 原图目录 + API）
+        logger.info("[Web] init_app_config 完成")
+
+    # 5. 注册路由
     register_route = getattr(_module, "register_route")
     register_route(web_driver, uppic_path / 'public', uppic_img_path)
-    
+    logger.info("[Web] register_route 完成, /uppic/ 已挂载")
+
     host = str(web_driver.config.host)
     port = web_driver.config.port
     if host in {"0.0.0.0", "127.0.0.1"}:
