@@ -155,6 +155,7 @@ async def _():
     uppic_dialogs_img_path.mkdir(parents=True, exist_ok=True)
     await connect()
     await create_dir()
+    await _startup_cleanup()
     web_app_init(driver)
     logger.info("文件检查完成，欢迎使用！")
 
@@ -271,6 +272,128 @@ async def create_dir():
                 continue
 
             await _save_snapshot(command, path)
+
+
+# ============== 启动自检：对齐 DB / 文件系统 / 配置 JSON ==============
+
+async def _startup_cleanup():
+    """Bot 启动后跑一次：确保数据库、文件系统、commands/aliases JSON 三者一致。
+
+    处理的缺口：
+    1. 指令文件夹被手动删了 → 对应 DB 表 DROP + commands_config 移除 + 别名清理
+    2. 文件夹在但 DB 里某些图片记录指向的文件不存在 → 删孤儿记录
+    3. alias 指向的原指令已不存在 → 清理 alias JSON
+    4. folder_snapshot 里有孤儿条目（对应 command 已从 commands_config 移除）→ 清掉
+    """
+    logger.info("启动自检：对齐数据库 / 文件系统 / 配置...")
+
+    cursor = await connection.cursor()
+    cleaned_tables: List[str] = []
+    cleaned_rows = 0
+    cleaned_aliases = 0
+    cleaned_snapshots = 0
+    removed_from_commands: List[str] = []
+
+    # ---- 1. 遍历所有注册的指令 ----
+    for command in list(current_commands_config.keys()):
+        folder_path = uppic_img_path / command
+
+        # 1a. 文件夹不存在 → 整个分类应该被删掉
+        if not folder_path.exists():
+            logger.warning(f"[自检] 指令「{command}」的文件夹不存在，清理 DB 表和配置")
+            try:
+                await cursor.execute(f'DROP TABLE IF EXISTS Pic_of_{command}')
+            except Exception as e:
+                logger.warning(f"[自检] DROP TABLE Pic_of_{command} 失败: {e}")
+            await cursor.execute('DELETE FROM folder_snapshot WHERE command = ?', (command,))
+            await connection.commit()
+
+            # 从 commands_config 移除
+            current_commands_config.pop(command, None)
+            removed_from_commands.append(command)
+
+            # 清除指向该指令的别名
+            dead_aliases = [a for a, t in current_aliases_config.items() if t == command]
+            for a in dead_aliases:
+                current_aliases_config.pop(a, None)
+            cleaned_aliases += len(dead_aliases)
+            continue
+
+        # 1b. 文件夹存在，检查 DB 记录里有没有孤儿文件
+        try:
+            await cursor.execute(f'SELECT id, img_url FROM Pic_of_{command}')
+            rows = await cursor.fetchall()
+        except Exception:
+            rows = []
+
+        orphan_ids: List[int] = []
+        for img_id, img_url in rows:
+            # img_url 形如 "capoo/uppic_capoo_xxx.jpg" 或 "uppic_capoo_xxx.jpg"
+            # 直接拼 uppic_img_path / img_url
+            file_path = uppic_img_path / img_url
+            if not file_path.exists():
+                orphan_ids.append(img_id)
+
+        if orphan_ids:
+            placeholders = ','.join('?' * len(orphan_ids))
+            await cursor.execute(
+                f'DELETE FROM Pic_of_{command} WHERE id IN ({placeholders})',
+                orphan_ids
+            )
+            await connection.commit()
+            cleaned_rows += len(orphan_ids)
+            logger.info(f"[自检] 指令「{command}」清理 {len(orphan_ids)} 条孤儿记录")
+
+        # 1c. 如果清理后表空了，考虑是否要 DROP（但保留，用户可能重新上传）
+
+    # ---- 2. 检查 folder_snapshot 孤儿 ----
+    await cursor.execute('SELECT command FROM folder_snapshot')
+    snap_rows = await cursor.fetchall()
+    for (snap_cmd,) in snap_rows:
+        if snap_cmd not in current_commands_config:
+            await cursor.execute('DELETE FROM folder_snapshot WHERE command = ?', (snap_cmd,))
+            cleaned_snapshots += 1
+    await connection.commit()
+
+    # ---- 3. 写回持久化 ----
+    if removed_from_commands:
+        _persist_commands()
+    if cleaned_aliases:
+        _persist_aliases()
+
+    # ---- 4. 清理对话图片目录里已失配的图片（对话已删除但图片还在）----
+    try:
+        current_dialog_imgs = {
+            v["content"] for v in current_dialogs_config.values()
+            if isinstance(v, dict) and v.get("type") == "image"
+        }
+        if uppic_dialogs_img_path.exists():
+            for f in os.listdir(uppic_dialogs_img_path):
+                if f.startswith("dlg_") and f not in current_dialog_imgs:
+                    try:
+                        (uppic_dialogs_img_path / f).unlink()
+                        logger.info(f"[自检] 清理失配对话图片: {f}")
+                    except Exception:
+                        pass
+    except Exception as e:
+        logger.warning(f"[自检] 对话图片清理失败: {e}")
+
+    # ---- 汇总日志 ----
+    parts = []
+    if removed_from_commands:
+        parts.append(f"移除分类 {removed_from_commands}")
+    if cleaned_rows:
+        parts.append(f"清理孤儿记录 {cleaned_rows} 条")
+    if cleaned_aliases:
+        parts.append(f"清理孤儿别名 {cleaned_aliases} 条")
+    if cleaned_snapshots:
+        parts.append(f"清理快照 {cleaned_snapshots} 条")
+
+    if parts:
+        logger.warning(f"[自检] 完成：{'、'.join(parts)}")
+    else:
+        logger.info("[自检] 数据库 / 文件系统 / 配置 完全一致 ✅")
+
 
 def web_app_init(web_driver: Driver):
     global connection
