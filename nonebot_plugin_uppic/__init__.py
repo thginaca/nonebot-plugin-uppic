@@ -1470,9 +1470,9 @@ roll_cmd = on_regex(r"^(?:/)?roll\s+(.+)$", priority=5, block=True)
 
 
 @roll_cmd.handle()
-async def handle_roll(event: Event, matched=RegexGroup()):
+async def handle_roll(event: Event, matched: Tuple[str, ...] = RegexGroup()):
     """roll 选项1 选项2 ...  —— 随机返回其中一个"""
-    raw = (matched or "").strip()
+    raw = (matched[0] if matched else "").strip()
     if not raw:
         await roll_cmd.finish("用法：roll 选项1 选项2 选项3 ...")
 
