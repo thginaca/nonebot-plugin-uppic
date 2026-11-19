@@ -27,6 +27,7 @@ class Config(BaseModel, extra='ignore'):
 COMMANDS_FILENAME = 'uppic_commands.json'
 PERMISSIONS_FILENAME = 'uppic_permissions.json'
 ALIASES_FILENAME = 'uppic_aliases.json'
+DIALOGS_FILENAME = 'uppic_dialogs.json'
 DEFAULT_COMMANDS: List[str] = ["capoo"]
 
 VALID_COMMAND_PATTERN = re.compile(r"^[A-Za-z0-9一-龥]+$")
@@ -34,6 +35,7 @@ VALID_COMMAND_PATTERN = re.compile(r"^[A-Za-z0-9一-龥]+$")
 commands_file_corrupted: bool = False
 permissions_file_corrupted: bool = False
 aliases_file_corrupted: bool = False
+dialogs_file_corrupted: bool = False
 
 
 def is_commands_file_writable() -> bool:
@@ -48,6 +50,10 @@ def is_aliases_file_writable() -> bool:
     return not aliases_file_corrupted
 
 
+def is_dialogs_file_writable() -> bool:
+    return not dialogs_file_corrupted
+
+
 def commands_file_path(store_dir: str) -> Path:
     return Path(store_dir) / COMMANDS_FILENAME
 
@@ -58,6 +64,10 @@ def permissions_file_path(store_dir: str) -> Path:
 
 def aliases_file_path(store_dir: str) -> Path:
     return Path(store_dir) / ALIASES_FILENAME
+
+
+def dialogs_file_path(store_dir: str) -> Path:
+    return Path(store_dir) / DIALOGS_FILENAME
 
 
 def load_commands_file(store_dir: str) -> Dict[str, Set[int]]:
@@ -294,6 +304,67 @@ def save_aliases_file(store_dir: str, aliases: Dict[str, str]) -> None:
         json.dump(serializable, f, ensure_ascii=False, indent=2)
 
 
+def load_dialogs_file(store_dir: str) -> Dict[str, Dict[str, str]]:
+    """读取自定义对话配置 JSON。
+
+    新格式：{ "触发关键词": {"type": "text|image", "content": "..."} }
+    兼容旧格式：{ "触发关键词": "纯文本回复" } 会自动迁移为 {"type": "text", "content": "..."}
+    """
+    global dialogs_file_corrupted
+    path = dialogs_file_path(store_dir)
+    if not path.exists():
+        logger.info(f"未找到 {path}，使用空对话配置")
+        return {}
+    try:
+        with path.open('r', encoding='utf-8') as f:
+            data = json.load(f)
+    except Exception as e:
+        dialogs_file_corrupted = True
+        logger.error(
+            f"读取 {path} 失败（JSON 格式错误）：{e}；本次启动以空对话列表运行，"
+            f"且运行时不会写回此文件以避免覆盖。请修复后重启 bot。"
+        )
+        return {}
+
+    if not isinstance(data, dict):
+        dialogs_file_corrupted = True
+        logger.error(f"{path} 顶层必须是 dict，得到 {type(data).__name__}")
+        return {}
+
+    result: Dict[str, Dict[str, str]] = {}
+    for keyword, reply in data.items():
+        if not isinstance(keyword, str):
+            logger.warning(f"{path} 中忽略非字符串关键词: {keyword!r}")
+            continue
+        keyword = keyword.strip()
+        if not keyword:
+            logger.warning(f"{path} 中忽略空关键词")
+            continue
+
+        # 兼容旧格式：值是字符串 → 自动转成 {"type": "text", "content": ...}
+        if isinstance(reply, str):
+            result[keyword] = {"type": "text", "content": reply}
+        elif isinstance(reply, dict):
+            rtype = reply.get("type")
+            rcontent = reply.get("content")
+            if rtype in ("text", "image") and isinstance(rcontent, str) and rcontent:
+                result[keyword] = {"type": rtype, "content": rcontent}
+            else:
+                logger.warning(f"{path} 中关键词 {keyword!r} 的结构无效: {reply!r}")
+        else:
+            logger.warning(f"{path} 中关键词 {keyword!r} 的值类型无效: {type(reply).__name__}")
+    return result
+
+
+def save_dialogs_file(store_dir: str, dialogs: Dict[str, Dict[str, str]]) -> None:
+    """全量覆盖写入自定义对话配置 JSON。注意：调用方应先检查 is_dialogs_file_writable()。"""
+    path = dialogs_file_path(store_dir)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    serializable = {k: v for k, v in sorted(dialogs.items())}
+    with path.open('w', encoding='utf-8') as f:
+        json.dump(serializable, f, ensure_ascii=False, indent=2)
+
+
 config_dict = Config.model_validate(get_driver().config.dict())
 uppic_store_dir_path: str = config_dict.uppic_store_dir_path
 uppic_banner_group = config_dict.uppic_banner_group
@@ -306,6 +377,9 @@ uppic_command_list: List[str] = list(uppic_commands_config.keys())
 
 # 别名配置：{ 别名 -> 原指令名 }
 uppic_aliases_config: Dict[str, str] = load_aliases_file(uppic_store_dir_path)
+
+# 自定义对话配置：{ 触发关键词 -> 回复文本 }
+uppic_dialogs_config: Dict[str, str] = load_dialogs_file(uppic_store_dir_path)
 
 uppic_endpoint = config_dict.uppic_endpoint
 uppic_bucket = config_dict.uppic_bucket

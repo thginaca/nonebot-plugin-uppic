@@ -2,6 +2,7 @@ import os
 import re
 import time
 import uuid
+import random
 from httpx import AsyncClient
 from typing import Any, Dict, List, Set, Tuple
 from nonebot.adapters.onebot.v11 import MessageSegment, Message, GroupMessageEvent, Bot
@@ -23,6 +24,7 @@ from .config import *
 from .config import save_commands_file, is_commands_file_writable, VALID_COMMAND_PATTERN
 from .config import save_permissions_file, is_permissions_file_writable
 from .config import save_aliases_file, is_aliases_file_writable
+from .config import save_dialogs_file, is_dialogs_file_writable
 from . import config as _config
 from .ali_oss import *
 from .compress import compress_image_from_bytes, get_image_extension, compute_phash, clear_compress_cache
@@ -44,9 +46,12 @@ current_commands_config: Dict[str, Set[int]] = _config.uppic_commands_config
 current_upload_permissions: Dict[int, str] = _config.uppic_upload_permissions
 # 别名配置：{ 别名 -> 原指令名 }
 current_aliases_config: Dict[str, str] = _config.uppic_aliases_config
+# 自定义对话配置：{ 触发关键词 -> {"type": "text|image", "content": "..."} }
+current_dialogs_config: Dict[str, Dict[str, str]] = _config.uppic_dialogs_config
 uppic_path = Path(uppic_store_dir_path)
 uppic_img_path = uppic_path / 'img'
 uppic_database_path = uppic_path / 'database'
+uppic_dialogs_img_path = uppic_path / 'dialogs_img'
 
 
 def _persist_commands() -> bool:
@@ -85,6 +90,18 @@ def _persist_aliases() -> bool:
         )
         return False
     save_aliases_file(uppic_store_dir_path, current_aliases_config)
+    return True
+
+
+def _persist_dialogs() -> bool:
+    """把当前自定义对话配置全量写回 JSON。"""
+    if not is_dialogs_file_writable():
+        logger.warning(
+            f"{_config.DIALOGS_FILENAME} 处于损坏状态，跳过本次持久化。"
+            f"对话变更仅在本次会话内生效，重启后会丢失。"
+        )
+        return False
+    save_dialogs_file(uppic_store_dir_path, current_dialogs_config)
     return True
 
 
@@ -135,6 +152,7 @@ driver = get_driver()
 async def _():
     logger.info("正在检查文件...")
     clear_compress_cache()
+    uppic_dialogs_img_path.mkdir(parents=True, exist_ok=True)
     await connect()
     await create_dir()
     web_app_init(driver)
@@ -441,6 +459,48 @@ async def _is_known_command(event: GroupMessageEvent) -> bool:
 picture = on_message(rule=Rule(_is_known_command), permission=GROUP, priority=2, block=True)
 
 
+# ====================== 自定义对话触发 ======================
+
+# Rule 里命中后把关键词存这里，handler 读取
+_matched_dialog_keyword: str = ""
+
+
+async def _check_dialog_trigger(event: GroupMessageEvent) -> bool:
+    """检查群消息是否精确命中已注册的对话关键词。"""
+    global _matched_dialog_keyword
+    _matched_dialog_keyword = ""
+    if event.group_id in uppic_banner_group:
+        return False
+    if not current_dialogs_config:
+        return False
+    msg_text = str(event.get_message()).strip()
+    if msg_text in current_dialogs_config:
+        _matched_dialog_keyword = msg_text
+        return True
+    return False
+
+
+dialog_trigger = on_message(rule=Rule(_check_dialog_trigger), permission=GROUP, priority=10, block=True)
+
+
+@dialog_trigger.handle()
+async def handle_dialog_trigger(event: GroupMessageEvent):
+    keyword = _matched_dialog_keyword
+    reply = current_dialogs_config.get(keyword)
+    if not reply:
+        return
+    rtype = reply.get("type", "text")
+    rcontent = reply.get("content", "")
+    if rtype == "image":
+        img_path = uppic_dialogs_img_path / rcontent
+        if img_path.exists():
+            await dialog_trigger.send(MessageSegment.image(file=str(img_path.resolve())))
+        else:
+            logger.warning(f"对话图片文件缺失: {img_path}，关键词「{keyword}」")
+    else:
+        await dialog_trigger.send(rcontent)
+
+
 @picture.handle()
 async def pic(event: GroupMessageEvent):
     if event.group_id in uppic_banner_group:
@@ -552,7 +612,7 @@ async def pic(event: GroupMessageEvent):
         await picture.send(f'{cmd_or_alias}有{fail_cnt}张出不来，稍后再试试吧~')
 
 
-add = on_regex(r"^添加(.+)$", permission=GROUP, priority=2, block=True)
+add = on_regex(r"^(?:添加|上传)(.+)$", permission=GROUP, priority=2, block=True)
 
 
 async def _ensure_new_command(command: str) -> None:
@@ -1274,3 +1334,181 @@ async def confirm_delete_category(event: GroupMessageEvent, confirm: Message = A
     if removed_aliases:
         msg += f"（{'、'.join(removed_aliases)}）"
     await delete_category.finish(msg)
+
+
+# ====================== roll 功能 ======================
+
+roll_cmd = on_command("roll", permission=GROUP, priority=5, block=True)
+
+
+@roll_cmd.handle()
+async def handle_roll(event: GroupMessageEvent, args: Message = CommandArg()):
+    """roll 选项1 选项2 ...  —— 随机返回其中一个"""
+    raw = args.extract_plain_text().strip()
+    if not raw:
+        await roll_cmd.finish("用法：roll 选项1 选项2 选项3 ...")
+
+    # 支持空格、逗号、中文顿号分隔
+    items = re.split(r"[\s,，、]+", raw)
+    items = [x for x in items if x]
+
+    if len(items) < 2:
+        await roll_cmd.finish("至少需要 2 个选项哦~")
+
+    pick = random.choice(items)
+    await roll_cmd.send(f"🎲 从 {len(items)} 个选项中抽中了：{pick}")
+
+
+# ====================== 自定义对话管理 ======================
+
+add_dialog = on_regex(r"^添加对话\s+(.+)$", permission=GROUP, priority=2, block=True)
+
+
+@add_dialog.handle()
+async def handle_add_dialog(event: GroupMessageEvent, matched: Tuple[Any, ...] = RegexGroup()):
+    """添加自定义对话：添加对话 <关键词> → bot 提示发送回复内容（文本或图片）"""
+    keyword = matched[0].strip()
+    if not keyword:
+        await add_dialog.finish("用法：添加对话 <触发关键词>")
+
+    if keyword in current_dialogs_config:
+        await add_dialog.send(f"关键词「{keyword}」已存在，将覆盖旧回复。")
+
+    add_dialog.set_arg("reply_keyword", keyword)
+    await add_dialog.send(f"已设置触发关键词「{keyword}」。请发送一段文本或一张图片作为 bot 的回复内容。")
+
+
+async def _download_image_for_dialog(bot: Bot, event: GroupMessageEvent) -> bytes | None:
+    """从消息的图片 segment 中下载图片数据，返回 bytes；失败返回 None。
+    复用 add_pic 的三套下载方案。
+    """
+    for seg in event.get_message():
+        if seg.type != 'image':
+            continue
+        pic_url = seg.data.get('url', '')
+        file_id = seg.data.get('file', '')
+
+        data = None
+        import base64 as _b64
+
+        # 方案1: get_image API
+        if file_id:
+            try:
+                img_info = await bot.get_image(file=file_id)
+                if isinstance(img_info, dict):
+                    local_path = img_info.get('file') or img_info.get('filename') or ''
+                    if local_path.startswith('file://'):
+                        local_path = local_path[7:]
+                    if local_path:
+                        try:
+                            with open(local_path, 'rb') as f:
+                                data = f.read()
+                        except Exception:
+                            pass
+                    if not data and img_info.get('base64'):
+                        data = _b64.b64decode(img_info['base64'])
+                    if not data and img_info.get('url'):
+                        pic_url = img_info['url']
+            except Exception:
+                pass
+
+        # 方案1.5: get_file API
+        if not data and file_id:
+            try:
+                file_info = await bot.call_api("get_file", file=file_id)
+                if isinstance(file_info, dict):
+                    if file_info.get('base64'):
+                        data = _b64.b64decode(file_info['base64'])
+                    elif file_info.get('file'):
+                        try:
+                            with open(file_info['file'], 'rb') as f:
+                                data = f.read()
+                        except Exception:
+                            pass
+            except Exception:
+                pass
+
+        # 方案2: httpx 下载 URL
+        if not data and pic_url:
+            headers = {
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+                "Referer": "https://qpic.cn/",
+                "Accept": "image/*,*/*",
+            }
+            try:
+                async with AsyncClient(verify=True, timeout=15.0, follow_redirects=True) as client:
+                    resp = await client.get(pic_url, headers=headers)
+                    resp.raise_for_status()
+                    data = resp.content
+            except Exception:
+                pass
+
+        if data and len(data) >= 50:
+            return data
+    return None
+
+
+@add_dialog.got("reply", prompt="请发送回复内容（文本或图片）：")
+async def save_dialog_reply(bot: Bot, event: GroupMessageEvent, reply_msg: Message = Arg('reply')):
+    keyword = add_dialog.get_arg("reply_keyword") or ""
+
+    # 先尝试取图片
+    img_data = await _download_image_for_dialog(bot, event)
+    if img_data:
+        # 压缩图片
+        img_data = compress_image_from_bytes(img_data)
+        # 保存到 dialogs_img 目录，用 keyword_hash 作为文件名避免特殊字符
+        kw_hash = hashlib.md5(keyword.encode('utf-8')).hexdigest()[:12] if keyword else uuid.uuid4().hex[:12]
+        ext = get_image_extension(img_data)
+        filename = f"dlg_{kw_hash}{ext}"
+        file_path = uppic_dialogs_img_path / filename
+        with file_path.open("wb") as f:
+            f.write(img_data)
+        current_dialogs_config[keyword] = {"type": "image", "content": filename}
+        msg = f"✅ 已添加对话：\n  触发词：「{keyword}」\n  回复：图片 ({len(img_data)} bytes)"
+    else:
+        # 纯文本
+        reply_text = reply_msg.extract_plain_text().strip()
+        if not reply_text:
+            await add_dialog.finish("回复内容不能为空哦~")
+        current_dialogs_config[keyword] = {"type": "text", "content": reply_text}
+        msg = f"✅ 已添加对话：\n  触发词：「{keyword}」\n  回复：「{reply_text}」"
+
+    if not _persist_dialogs():
+        msg += f"\n⚠️ {_config.DIALOGS_FILENAME} 损坏，本次设置不会持久化。"
+    await add_dialog.finish(msg)
+
+
+remove_dialog = on_regex(r"^删除对话\s+(.+)$", permission=GROUP, priority=2, block=True)
+
+
+@remove_dialog.handle()
+async def handle_remove_dialog(event: GroupMessageEvent, matched: Tuple[Any, ...] = RegexGroup()):
+    keyword = matched[0].strip()
+    if not keyword:
+        await remove_dialog.finish("用法：删除对话 <触发关键词>")
+
+    if keyword not in current_dialogs_config:
+        await remove_dialog.finish(f"关键词「{keyword}」不存在！")
+
+    old_reply = current_dialogs_config.pop(keyword)
+
+    # 如果是图片类型，删掉本地图片文件
+    if old_reply.get("type") == "image":
+        img_file = uppic_dialogs_img_path / old_reply.get("content", "")
+        try:
+            if img_file.exists():
+                img_file.unlink()
+        except Exception as e:
+            logger.warning(f"删除对话图片文件失败 {img_file}: {e}")
+
+    rtype = old_reply.get("type", "text")
+    rcontent = old_reply.get("content", "")
+    if rtype == "image":
+        display = f"图片文件 {rcontent}"
+    else:
+        display = f"「{rcontent}」"
+    msg = f"✅ 已删除对话：「{keyword}」 → {display}"
+    if not _persist_dialogs():
+        msg += f"\n⚠️ {_config.DIALOGS_FILENAME} 损坏，本次删除不会持久化。"
+    await remove_dialog.finish(msg)
