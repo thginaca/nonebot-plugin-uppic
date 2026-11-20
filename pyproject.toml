@@ -20,6 +20,7 @@ httpx = ">=0.20.0,<1.0.0"
 alibabacloud_oss_v2 = ">=1.1.0"
 pillow = ">=11.0.0"
 imagehash = ">=4.3.0"
+python-multipart = ">=0.0.5"
 
 [build-system]
 requires = ["poetry-core"]
