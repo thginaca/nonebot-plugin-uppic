@@ -28,7 +28,7 @@ COMMANDS_FILENAME = 'uppic_commands.json'
 PERMISSIONS_FILENAME = 'uppic_permissions.json'
 ALIASES_FILENAME = 'uppic_aliases.json'
 DIALOGS_FILENAME = 'uppic_dialogs.json'
-DEFAULT_COMMANDS: List[str] = ["capoo"]
+DEFAULT_COMMANDS: List[str] = []
 
 VALID_COMMAND_PATTERN = re.compile(r"^[A-Za-z0-9一-龥]+$")
 
