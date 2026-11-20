@@ -73,9 +73,6 @@ def init_app_config(img_path: Path, super_users: list, db_connection, no_upload_
 def register_route(driver: Driver, uppic_public_path: Path, uppic_img_path: Path):
     app = driver.server_app
 
-    # 挂鉴权中间件（没配 token 时 middleware 自动跳过）
-    app.add_middleware(UppicWebTokenMiddleware)
-
     # 先注册API路由（否则会被 /uppic mount 拦截返回 405）
     @app.post("/uppic/api/delete")
     async def delete_image(req: DeleteRequest):

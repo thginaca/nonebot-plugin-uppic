@@ -157,6 +157,16 @@ _recent_sent: Dict[str, Set[int]] = {}
 # 激活驱动器
 driver = get_driver()
 
+# 在 app 启动前挂好 Web 鉴权中间件（如果配了 token）
+# 必须在 module 级别做，不能在 on_startup 里——那时 app 已经 start，Starlette 不让 add_middleware
+if uppic_web_token:
+    try:
+        from .drivers.fastapi import UppicWebTokenMiddleware
+        driver.server_app.add_middleware(UppicWebTokenMiddleware)
+        logger.info(f"[Web] 已挂载 Web 鉴权中间件（token 长度={len(uppic_web_token)}）")
+    except Exception as _e:
+        logger.warning(f"[Web] 挂载 Web 鉴权中间件失败: {_e}")
+
 
 @driver.on_startup
 async def _():
