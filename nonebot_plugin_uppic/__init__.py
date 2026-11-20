@@ -766,7 +766,7 @@ async def pic(event: GroupMessageEvent):
         await picture.send(f'{cmd_or_alias}有{fail_cnt}张出不来，稍后再试试吧~')
 
 
-add = on_regex(r"^(?:添加|上传)(.+)$", permission=GROUP, priority=2, block=True)
+add = on_regex(r"^(?:添加|上传)(?!权限|oss)(.+)$", permission=GROUP, priority=2, block=True)
 
 
 async def _ensure_new_command(command: str) -> None:
