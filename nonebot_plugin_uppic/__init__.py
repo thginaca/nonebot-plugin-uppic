@@ -1075,21 +1075,51 @@ async def handle_upload_permission(event: GroupMessageEvent, args: Message = Com
         await upload_permission.finish("你没有权限管理上传权限（需要当前群群管/群主，或超级用户）！")
     
     params = args.extract_plain_text().strip().split()
-    if len(params) != 2:
-        await upload_permission.finish("用法：@bot 上传权限 <群号> <权限模式>\n权限模式：admin_only（仅群管）/ all_members（所有群员）")
+    if not params:
+        # 无参数：显示当前群权限
+        gid = event.group_id
+        config = current_upload_permissions.get(gid, {"mode": "admin_only", "allowed_users": []})
+        mode_label = "所有群员可上传" if config["mode"] == "all_members" else "仅群管可上传"
+        await upload_permission.finish(
+            f"当前群 {gid} 的上传权限：{mode_label}\n"
+            f"允许上传的普通用户：{config.get('allowed_users', []) or '无'}\n\n"
+            f"用法：\n"
+            f"  @bot 上传权限 all_members        ← 设置当前群所有群员可上传\n"
+            f"  @bot 上传权限 admin_only         ← 设置当前群仅群管可上传\n"
+            f"  @bot 上传权限 <群号> <模式>      ← 设置其他群的权限（仅超管）"
+        )
     
-    try:
-        gid = int(params[0])
-    except ValueError:
-        await upload_permission.finish("群号必须是数字！")
+    # 解析参数：要么 1 个参数（模式 → 当前群），要么 2 个参数（群号 + 模式 → 指定群）
+    gid: int
+    mode: str
+    if len(params) == 1:
+        mode = params[0]
+        gid = event.group_id
+    elif len(params) == 2:
+        if not _is_super_user(event.user_id):
+            await upload_permission.finish("指定其他群号需要超级用户权限！")
+        try:
+            gid = int(params[0])
+        except ValueError:
+            await upload_permission.finish("群号必须是数字！")
+        mode = params[1]
+    else:
+        await upload_permission.finish(
+            "用法：\n"
+            "  @bot 上传权限 all_members        ← 设置当前群所有群员可上传\n"
+            "  @bot 上传权限 admin_only         ← 设置当前群仅群管可上传\n"
+            "  @bot 上传权限 <群号> <模式>      ← 设置其他群的权限（仅超管）"
+        )
+        return
     
-    mode = params[1]
     if mode not in ("admin_only", "all_members"):
         await upload_permission.finish("权限模式必须是 admin_only 或 all_members！")
     
     current_upload_permissions.setdefault(gid, {"mode": "admin_only", "allowed_users": []})
     current_upload_permissions[gid]["mode"] = mode
     msg = f"已设置群 {gid} 的上传权限为「{mode}」。"
+    if gid == event.group_id:
+        msg += "\n✅ 这是当前群，设置立即生效。"
     if not _persist_permissions():
         msg += f"\n⚠️ {_config.PERMISSIONS_FILENAME} 损坏，本次设置不会持久化。"
     await upload_permission.finish(msg)
