@@ -404,16 +404,21 @@ def web_app_init(web_driver: Driver):
         logger.warning(f"[Web] 图片目录不存在: {uppic_img_path}，创建空目录")
         uppic_img_path.mkdir(parents=True, exist_ok=True)
 
-    # 2. 导入 drivers.fastapi 模块
+    # 2. 导入 drivers.<driver_name> 模块（用相对导入，避免 NoneBot 通过 plugins. 前缀加载时
+    #    importlib.import_module("nonebot_plugin_uppic.xxx") 找不到顶层包的问题）
     driver_name = driver.type.split('+')[0]
     try:
-        _module = importlib.import_module(f"nonebot_plugin_uppic.drivers.{driver_name}")
+        from . import drivers as _drivers_pkg
+        _module = getattr(_drivers_pkg, driver_name, None)
+        if _module is None:
+            # drivers 子包有 __init__.py 但没直接导出子模块，尝试 import 具体文件
+            import importlib
+            _module = importlib.import_module(f".drivers.{driver_name}", __name__)
         logger.info(f"[Web] drivers.{driver_name} 导入成功: {_module.__file__}")
     except ImportError as e:
         logger.warning(
             f"[Web] Driver {driver.type} 不支持: {e}；"
-            f"请检查 drivers/{driver_name}.py 是否存在，"
-            f"或运行 pip install -U --force-reinstall nonebot-plugin-uppic",
+            f"请检查 drivers/{driver_name}.py 是否存在",
             exc_info=True
         )
         return
