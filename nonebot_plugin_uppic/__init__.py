@@ -116,6 +116,16 @@ def _is_super_user(uid: int) -> bool:
     return uid in uppic_super_users
 
 
+def _is_group_admin_or_owner(event: GroupMessageEvent) -> bool:
+    """判断用户是否是当前群的群管或群主（超管另行放行）。"""
+    return getattr(event.sender, "role", None) in ("admin", "owner")
+
+
+def _can_manage_permissions(event: GroupMessageEvent) -> bool:
+    """判断用户是否有权限管理上传权限（超管 OR 当前群的群管/群主）。"""
+    return _is_super_user(event.user_id) or _is_group_admin_or_owner(event)
+
+
 def _can_upload(event: GroupMessageEvent) -> bool:
     """检查用户是否有权限上传图片。
     
@@ -1061,9 +1071,8 @@ upload_permission = on_command("上传权限", rule=to_me(), priority=2, block=T
 
 @upload_permission.handle()
 async def handle_upload_permission(event: GroupMessageEvent, args: Message = CommandArg()) -> None:
-    uid = event.user_id
-    if uid not in uppic_super_users:
-        await upload_permission.finish("你没有权限管理上传权限！")
+    if not _can_manage_permissions(event):
+        await upload_permission.finish("你没有权限管理上传权限（需要当前群群管/群主，或超级用户）！")
     
     params = args.extract_plain_text().strip().split()
     if len(params) != 2:
@@ -1091,9 +1100,8 @@ add_upload_user = on_command("添加上传用户", rule=to_me(), priority=2, blo
 
 @add_upload_user.handle()
 async def handle_add_upload_user(event: GroupMessageEvent, args: Message = CommandArg()) -> None:
-    uid = event.user_id
-    if uid not in uppic_super_users:
-        await add_upload_user.finish("你没有权限管理上传权限！")
+    if not _can_manage_permissions(event):
+        await add_upload_user.finish("你没有权限管理上传权限（需要当前群群管/群主，或超级用户）！")
     
     params = args.extract_plain_text().strip().split()
     if len(params) != 2:
@@ -1121,9 +1129,8 @@ remove_upload_user = on_command("移除上传用户", rule=to_me(), priority=2, 
 
 @remove_upload_user.handle()
 async def handle_remove_upload_user(event: GroupMessageEvent, args: Message = CommandArg()) -> None:
-    uid = event.user_id
-    if uid not in uppic_super_users:
-        await remove_upload_user.finish("你没有权限管理上传权限！")
+    if not _can_manage_permissions(event):
+        await remove_upload_user.finish("你没有权限管理上传权限（需要当前群群管/群主，或超级用户）！")
     
     params = args.extract_plain_text().strip().split()
     if len(params) != 2:
