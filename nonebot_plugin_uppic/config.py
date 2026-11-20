@@ -22,6 +22,7 @@ class Config(BaseModel, extra='ignore'):
     uppic_oss_access_key_secret: Optional[str] = None
     uppic_oss_no_upload_list: List[str] = []
     uppic_super_users: List[int] = []
+    uppic_web_token: Optional[str] = None  # Web 图片墙鉴权 token，不配则公开访问
 
 
 COMMANDS_FILENAME = 'uppic_commands.json'
@@ -388,5 +389,6 @@ uppic_oss_access_key_id = config_dict.uppic_oss_access_key_id
 uppic_oss_access_key_secret = config_dict.uppic_oss_access_key_secret
 uppic_oss_no_upload_list = config_dict.uppic_oss_no_upload_list
 uppic_super_users = config_dict.uppic_super_users
+uppic_web_token = config_dict.uppic_web_token  # None 表示不鉴权
 
 uppic_upload_permissions: Dict[int, str] = load_permissions_file(uppic_store_dir_path)

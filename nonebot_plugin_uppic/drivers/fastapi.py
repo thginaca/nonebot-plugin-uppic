@@ -3,10 +3,41 @@ from pathlib import Path
 from typing import Optional, Callable
 
 from fastapi.staticfiles import StaticFiles
-from fastapi import UploadFile, File, Form
+from fastapi import UploadFile, File, Form, Request
+from starlette.middleware.base import BaseHTTPMiddleware
+from starlette.responses import JSONResponse
 from pydantic import BaseModel
 
 from nonebot.drivers.fastapi import Driver
+
+# 全局 token 引用，由 init_app_config 设置
+_web_token: Optional[str] = None
+
+
+class UppicWebTokenMiddleware(BaseHTTPMiddleware):
+    """校验 /uppic/* 路径的请求是否携带正确 token。
+    - .env 没配 UPPIC_WEB_TOKEN 时，不做任何拦截（向下兼容）
+    - 配了 token 后，所有 /uppic/ 开头的请求都必须带 ?token=xxx 或 header X-Uppic-Token: xxx
+    """
+
+    async def dispatch(self, request: Request, call_next):
+        if _web_token is None:
+            return await call_next(request)
+
+        path = request.url.path
+        if not path.startswith("/uppic"):
+            return await call_next(request)
+
+        # token 从 query 参数或 header 取
+        token = request.query_params.get("token") or request.headers.get("X-Uppic-Token")
+
+        if token != _web_token:
+            return JSONResponse(
+                status_code=401,
+                content={"success": False, "message": "Unauthorized: 请携带正确的 ?token=xxx 参数访问"},
+            )
+
+        return await call_next(request)
 
 
 # 存储全局配置引用，供API使用
@@ -27,19 +58,23 @@ class DeleteFolderRequest(BaseModel):
     folder: str
 
 
-def init_app_config(img_path: Path, super_users: list, db_connection, no_upload_list: list, on_delete_callback: Callable = None, recent_sent=None, on_delete_folder_callback: Callable = None, on_upload_callback: Callable = None):
+def init_app_config(img_path: Path, super_users: list, db_connection, no_upload_list: list, on_delete_callback: Callable = None, recent_sent=None, on_delete_folder_callback: Callable = None, on_upload_callback: Callable = None, web_token: Optional[str] = None):
     """初始化应用配置，供API使用"""
-    global _img_path, _db_connection, _on_delete_callback, _on_delete_folder_callback, _on_upload_callback, _recent_sent_ref
+    global _img_path, _db_connection, _on_delete_callback, _on_delete_folder_callback, _on_upload_callback, _recent_sent_ref, _web_token
     _img_path = img_path
     _db_connection = db_connection
     _on_delete_callback = on_delete_callback
     _on_delete_folder_callback = on_delete_folder_callback
     _on_upload_callback = on_upload_callback
     _recent_sent_ref = recent_sent
+    _web_token = web_token
 
 
 def register_route(driver: Driver, uppic_public_path: Path, uppic_img_path: Path):
     app = driver.server_app
+
+    # 挂鉴权中间件（没配 token 时 middleware 自动跳过）
+    app.add_middleware(UppicWebTokenMiddleware)
 
     # 先注册API路由（否则会被 /uppic mount 拦截返回 405）
     @app.post("/uppic/api/delete")

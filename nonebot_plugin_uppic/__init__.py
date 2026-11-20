@@ -452,7 +452,7 @@ def web_app_init(web_driver: Driver):
     # 4. 初始化 API 配置
     init_app_config_fn = getattr(_module, "init_app_config", None)
     if init_app_config_fn:
-        init_app_config_fn(uppic_img_path, uppic_super_users, connection, uppic_oss_no_upload_list, regenerate_web_site, _recent_sent, delete_folder_cleanup, upload_image_callback)
+        init_app_config_fn(uppic_img_path, uppic_super_users, connection, uppic_oss_no_upload_list, regenerate_web_site, _recent_sent, delete_folder_cleanup, upload_image_callback, web_token=uppic_web_token)
         logger.info("[Web] init_app_config 完成")
 
     # 5. 注册路由
