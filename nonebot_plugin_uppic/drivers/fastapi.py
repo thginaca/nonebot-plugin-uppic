@@ -3,8 +3,8 @@ from pathlib import Path
 from typing import Optional, Callable
 
 from fastapi.staticfiles import StaticFiles
-from fastapi import UploadFile, File, Form, Request
-from starlette.middleware.base import BaseHTTPMiddleware
+from fastapi import UploadFile, File, Form, Request, Depends
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from starlette.responses import JSONResponse
 from pydantic import BaseModel
 
@@ -14,30 +14,23 @@ from nonebot.drivers.fastapi import Driver
 _web_token: Optional[str] = None
 
 
-class UppicWebTokenMiddleware(BaseHTTPMiddleware):
-    """校验 /uppic/* 路径的请求是否携带正确 token。
-    - .env 没配 UPPIC_WEB_TOKEN 时，不做任何拦截（向下兼容）
-    - 配了 token 后，所有 /uppic/ 开头的请求都必须带 ?token=xxx 或 header X-Uppic-Token: xxx
+def _verify_web_token(request: Request) -> Optional[JSONResponse]:
+    """FastAPI dependency：如果配了 UPPIC_WEB_TOKEN，校验请求是否携带正确 token。
+    - 不配 token 时返回 None（不拦截）
+    - 配了 token 但没带或不对，返回 401 JSONResponse
+    - 带对了返回 None（放行）
     """
+    if _web_token is None:
+        return None
 
-    async def dispatch(self, request: Request, call_next):
-        if _web_token is None:
-            return await call_next(request)
+    token = request.query_params.get("token") or request.headers.get("X-Uppic-Token")
 
-        path = request.url.path
-        if not path.startswith("/uppic"):
-            return await call_next(request)
-
-        # token 从 query 参数或 header 取
-        token = request.query_params.get("token") or request.headers.get("X-Uppic-Token")
-
-        if token != _web_token:
-            return JSONResponse(
-                status_code=401,
-                content={"success": False, "message": "Unauthorized: 请携带正确的 ?token=xxx 参数访问"},
-            )
-
-        return await call_next(request)
+    if token != _web_token:
+        return JSONResponse(
+            status_code=401,
+            content={"success": False, "message": "Unauthorized: 请携带正确的 ?token=xxx 参数访问"},
+        )
+    return None
 
 
 # 存储全局配置引用，供API使用
@@ -73,8 +66,16 @@ def init_app_config(img_path: Path, super_users: list, db_connection, no_upload_
 def register_route(driver: Driver, uppic_public_path: Path, uppic_img_path: Path):
     app = driver.server_app
 
-    # 先注册API路由（否则会被 /uppic mount 拦截返回 405）
-    @app.post("/uppic/api/delete")
+    # ===== Token 校验包装器 =====
+    # 配了 UPPIC_WEB_TOKEN 时，所有 /uppic/* 请求都会先过 _verify_web_token
+    def _check(request: Request):
+        resp = _verify_web_token(request)
+        if resp is not None:
+            from fastapi import HTTPException
+            raise HTTPException(status_code=resp.status_code, detail=resp.body.decode())
+
+    # 先注册 API 路由（否则会被 /uppic mount 拦截返回 405）
+    @app.post("/uppic/api/delete", dependencies=[Depends(_check)])
     async def delete_image(req: DeleteRequest):
         """删除图片文件和数据库记录"""
         if _img_path is None:
@@ -143,7 +144,7 @@ def register_route(driver: Driver, uppic_public_path: Path, uppic_img_path: Path
         except Exception as e:
             return {"success": False, "message": f"删除文件失败: {str(e)}"}
 
-    @app.post("/uppic/api/delete_folder")
+    @app.post("/uppic/api/delete_folder", dependencies=[Depends(_check)])
     async def delete_folder(req: DeleteFolderRequest):
         """删除整个分类（文件夹+数据库+配置）"""
         if _img_path is None:
@@ -187,7 +188,7 @@ def register_route(driver: Driver, uppic_public_path: Path, uppic_img_path: Path
 
         return {"success": True, "message": f"已删除分类「{folder}」，共 {deleted_files} 个文件"}
 
-    @app.post("/uppic/api/upload")
+    @app.post("/uppic/api/upload", dependencies=[Depends(_check)])
     async def upload_image(folder: str = Form(...), file: UploadFile = File(...)):
         """网页端上传图片到指定分类"""
         if _on_upload_callback is None:
@@ -216,10 +217,41 @@ def register_route(driver: Driver, uppic_public_path: Path, uppic_img_path: Path
         except Exception as e:
             return {"success": False, "message": f"上传失败: {e}"}
 
-    # 挂载原图目录
-    img_path = str(uppic_img_path.resolve())
-    app.mount("/uppic/img", StaticFiles(directory=img_path), name="uppic_img")
+    # ===== 挂载静态文件 + 统一 token 校验 =====
+    # 主 app 已 start，不能 add_middleware → 改为把 StaticFiles 包成带 middleware 的子应用再 mount
+    import logging
+    _log = logging.getLogger("nonebot_plugin_uppic")
 
-    # 挂载HTML静态文件
+    img_path = str(uppic_img_path.resolve())
     html_path = str(uppic_public_path.resolve())
-    app.mount("/uppic", StaticFiles(directory=html_path, html=True), name="uppic")
+
+    if _web_token is not None:
+        _log.info(f"[Web] _web_token={_web_token!r}，用子应用 middleware 方案")
+        from starlette.applications import Starlette as _Starlette
+        from starlette.middleware.base import BaseHTTPMiddleware
+
+        class _TokenMiddleware(BaseHTTPMiddleware):
+            async def dispatch(self, request: Request, call_next):
+                token = request.query_params.get("token") or request.headers.get("X-Uppic-Token")
+                if token != _web_token:
+                    _log.info(f"[Web] 子应用 middleware 拦截：path={request.url.path} token={token!r}")
+                    return JSONResponse(status_code=401, content={"success": False, "message": "Unauthorized: 请携带正确的 ?token=xxx 参数访问"})
+                return await call_next(request)
+
+        # 子应用 1：/uppic/img（原图）
+        img_sub = _Starlette()
+        img_sub.add_middleware(_TokenMiddleware)
+        img_sub.mount("/", StaticFiles(directory=img_path), name="img_static")
+        app.mount("/uppic/img", img_sub, name="uppic_img")
+
+        # 子应用 2：/uppic（图片墙 HTML）
+        uppic_sub = _Starlette()
+        uppic_sub.add_middleware(_TokenMiddleware)
+        uppic_sub.mount("/", StaticFiles(directory=html_path, html=True), name="html_static")
+        app.mount("/uppic", uppic_sub, name="uppic")
+
+        _log.info("[Web] ✅ 子应用 middleware 已就位，/uppic/img 和 /uppic 均带 token 校验")
+    else:
+        _log.warning("[Web] ⚠️ 没有配 UPPIC_WEB_TOKEN，静态文件公开访问")
+        app.mount("/uppic/img", StaticFiles(directory=img_path), name="uppic_img")
+        app.mount("/uppic", StaticFiles(directory=html_path, html=True), name="uppic")

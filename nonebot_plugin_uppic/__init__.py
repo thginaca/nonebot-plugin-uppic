@@ -157,15 +157,8 @@ _recent_sent: Dict[str, Set[int]] = {}
 # 激活驱动器
 driver = get_driver()
 
-# 在 app 启动前挂好 Web 鉴权中间件（如果配了 token）
-# 必须在 module 级别做，不能在 on_startup 里——那时 app 已经 start，Starlette 不让 add_middleware
-if uppic_web_token:
-    try:
-        from .drivers.fastapi import UppicWebTokenMiddleware
-        driver.server_app.add_middleware(UppicWebTokenMiddleware)
-        logger.info(f"[Web] 已挂载 Web 鉴权中间件（token 长度={len(uppic_web_token)}）")
-    except Exception as _e:
-        logger.warning(f"[Web] 挂载 Web 鉴权中间件失败: {_e}")
+# Web 鉴权 token 校验改在 drivers/fastapi.py 的 register_route 里用 dependency 做
+# 因为 Starlette/FastAPI 不保证 module 级别时 server_app 已就绪
 
 
 @driver.on_startup
@@ -462,11 +455,13 @@ def web_app_init(web_driver: Driver):
     # 4. 初始化 API 配置
     init_app_config_fn = getattr(_module, "init_app_config", None)
     if init_app_config_fn:
+        logger.info(f"[Web] 传给 init_app_config 的 web_token={uppic_web_token!r}")
         init_app_config_fn(uppic_img_path, uppic_super_users, connection, uppic_oss_no_upload_list, regenerate_web_site, _recent_sent, delete_folder_cleanup, upload_image_callback, web_token=uppic_web_token)
         logger.info("[Web] init_app_config 完成")
 
     # 5. 注册路由
     register_route = getattr(_module, "register_route")
+    logger.info(f"[Web] register_route 前 uppic_web_token={uppic_web_token!r}")
     register_route(web_driver, uppic_path / 'public', uppic_img_path)
     logger.info("[Web] register_route 完成, /uppic/ 已挂载")
 
@@ -1027,64 +1022,66 @@ async def handle_oss(event: GroupMessageEvent) -> None:
     await OSS.finish(f'上传完成，用时: {elapsed_time:.2f}秒，地址：{endpoint}/')
 
 
-# 分群管理：@bot 禁用<指令> / @bot 启用<指令>
-disable = on_command("禁用", rule=to_me(), permission=GROUP_ADMIN | GROUP_OWNER, priority=2, block=True)
+# 分群管理：禁用/启用/上传权限 等命令
+# 用 on_regex 替代 on_command，这样不用写 / 也不用 @bot 就能识别
+disable = on_regex(r"^(?:/)?禁用\s+(.+)$", permission=GROUP_ADMIN | GROUP_OWNER, priority=2, block=True)
 
 
 @disable.handle()
-async def handle_disable(event: GroupMessageEvent, args: Message = CommandArg()) -> None:
-    input_name = args.extract_plain_text().strip()
-    if not input_name:
-        await disable.finish("请指定要禁用的指令名！例如：@bot 禁用 capoo")
-    if not VALID_COMMAND_PATTERN.fullmatch(input_name):
+async def handle_disable(event: GroupMessageEvent, matched = RegexGroup()) -> None:
+    raw = (matched[0] if matched else "").strip()
+    if not raw:
+        await disable.finish("请指定要禁用的指令名！例如：禁用 capoo")
+    if not VALID_COMMAND_PATTERN.fullmatch(raw):
         await disable.finish("指令名称仅支持字母、汉字和数字！")
-    command = _resolve_command(input_name)
+    command = _resolve_command(raw)
     if command not in current_commands_config:
-        await disable.finish(f"指令「{input_name}」不存在！")
+        await disable.finish(f"指令「{raw}」不存在！")
     gid = event.group_id
     disabled = current_commands_config[command]
     if gid in disabled:
-        await disable.finish(f"指令「{input_name}」在本群已经是禁用状态。")
+        await disable.finish(f"指令「{raw}」在本群已经是禁用状态。")
     disabled.add(gid)
-    msg = f"已在本群禁用指令「{input_name}」。"
+    msg = f"已在本群禁用指令「{raw}」。"
     if not _persist_commands():
         msg += f"\n⚠️ {_config.COMMANDS_FILENAME} 损坏，本次禁用不会持久化，重启后会丢失。请管理员尽快修复 JSON。"
     await disable.finish(msg)
 
 
-enable = on_command("启用", rule=to_me(), permission=GROUP_ADMIN | GROUP_OWNER, priority=2, block=True)
+enable = on_regex(r"^(?:/)?启用\s+(.+)$", permission=GROUP_ADMIN | GROUP_OWNER, priority=2, block=True)
 
 
 @enable.handle()
-async def handle_enable(event: GroupMessageEvent, args: Message = CommandArg()) -> None:
-    input_name = args.extract_plain_text().strip()
-    if not input_name:
-        await enable.finish("请指定要启用的指令名！例如：@bot 启用 capoo")
-    if not VALID_COMMAND_PATTERN.fullmatch(input_name):
+async def handle_enable(event: GroupMessageEvent, matched = RegexGroup()) -> None:
+    raw = (matched[0] if matched else "").strip()
+    if not raw:
+        await enable.finish("请指定要启用的指令名！例如：启用 capoo")
+    if not VALID_COMMAND_PATTERN.fullmatch(raw):
         await enable.finish("指令名称仅支持字母、汉字和数字！")
-    command = _resolve_command(input_name)
+    command = _resolve_command(raw)
     if command not in current_commands_config:
-        await enable.finish(f"指令「{input_name}」不存在！")
+        await enable.finish(f"指令「{raw}」不存在！")
     gid = event.group_id
     disabled = current_commands_config[command]
     if gid not in disabled:
-        await enable.finish(f"指令「{input_name}」在本群本来就没有被禁用。")
+        await enable.finish(f"指令「{raw}」在本群本来就没有被禁用。")
     disabled.discard(gid)
-    msg = f"已在本群重新启用指令「{input_name}」。"
+    msg = f"已在本群重新启用指令「{raw}」。"
     if not _persist_commands():
         msg += f"\n⚠️ {_config.COMMANDS_FILENAME} 损坏，本次启用不会持久化，重启后会丢失。请管理员尽快修复 JSON。"
     await enable.finish(msg)
 
 
-upload_permission = on_command("上传权限", rule=to_me(), priority=2, block=True)
+upload_permission = on_regex(r"^(?:/)?上传权限(?:\s+(.+))?$", priority=2, block=True)
 
 
 @upload_permission.handle()
-async def handle_upload_permission(event: GroupMessageEvent, args: Message = CommandArg()) -> None:
+async def handle_upload_permission(event: GroupMessageEvent, matched = RegexGroup()) -> None:
     if not _can_manage_permissions(event):
         await upload_permission.finish("你没有权限管理上传权限（需要当前群群管/群主，或超级用户）！")
     
-    params = args.extract_plain_text().strip().split()
+    raw = (matched[0] or "").strip()
+    params = raw.split() if raw else []
     if not params:
         # 无参数：显示当前群权限
         gid = event.group_id
@@ -1094,9 +1091,9 @@ async def handle_upload_permission(event: GroupMessageEvent, args: Message = Com
             f"当前群 {gid} 的上传权限：{mode_label}\n"
             f"允许上传的普通用户：{config.get('allowed_users', []) or '无'}\n\n"
             f"用法：\n"
-            f"  @bot 上传权限 all_members        ← 设置当前群所有群员可上传\n"
-            f"  @bot 上传权限 admin_only         ← 设置当前群仅群管可上传\n"
-            f"  @bot 上传权限 <群号> <模式>      ← 设置其他群的权限（仅超管）"
+            f"  上传权限 all_members        ← 设置当前群所有群员可上传\n"
+            f"  上传权限 admin_only         ← 设置当前群仅群管可上传\n"
+            f"  上传权限 <群号> <模式>      ← 设置其他群的权限（仅超管）"
         )
     
     # 解析参数：要么 1 个参数（模式 → 当前群），要么 2 个参数（群号 + 模式 → 指定群）
@@ -1116,9 +1113,9 @@ async def handle_upload_permission(event: GroupMessageEvent, args: Message = Com
     else:
         await upload_permission.finish(
             "用法：\n"
-            "  @bot 上传权限 all_members        ← 设置当前群所有群员可上传\n"
-            "  @bot 上传权限 admin_only         ← 设置当前群仅群管可上传\n"
-            "  @bot 上传权限 <群号> <模式>      ← 设置其他群的权限（仅超管）"
+            "  上传权限 all_members        ← 设置当前群所有群员可上传\n"
+            "  上传权限 admin_only         ← 设置当前群仅群管可上传\n"
+            "  上传权限 <群号> <模式>      ← 设置其他群的权限（仅超管）"
         )
         return
     
@@ -1135,17 +1132,18 @@ async def handle_upload_permission(event: GroupMessageEvent, args: Message = Com
     await upload_permission.finish(msg)
 
 
-add_upload_user = on_command("添加上传用户", rule=to_me(), priority=2, block=True)
+add_upload_user = on_regex(r"^(?:/)?添加上传用户\s+(.+)$", priority=2, block=True)
 
 
 @add_upload_user.handle()
-async def handle_add_upload_user(event: GroupMessageEvent, args: Message = CommandArg()) -> None:
+async def handle_add_upload_user(event: GroupMessageEvent, matched = RegexGroup()) -> None:
     if not _can_manage_permissions(event):
         await add_upload_user.finish("你没有权限管理上传权限（需要当前群群管/群主，或超级用户）！")
     
-    params = args.extract_plain_text().strip().split()
+    raw = (matched[0] or "").strip()
+    params = raw.split() if raw else []
     if len(params) != 2:
-        await add_upload_user.finish("用法：@bot 添加上传用户 <群号> <用户ID>")
+        await add_upload_user.finish("用法：添加上传用户 <群号> <用户ID>")
     
     try:
         gid = int(params[0])
@@ -1164,17 +1162,18 @@ async def handle_add_upload_user(event: GroupMessageEvent, args: Message = Comma
     await add_upload_user.finish(msg)
 
 
-remove_upload_user = on_command("移除上传用户", rule=to_me(), priority=2, block=True)
+remove_upload_user = on_regex(r"^(?:/)?移除上传用户\s+(.+)$", priority=2, block=True)
 
 
 @remove_upload_user.handle()
-async def handle_remove_upload_user(event: GroupMessageEvent, args: Message = CommandArg()) -> None:
+async def handle_remove_upload_user(event: GroupMessageEvent, matched = RegexGroup()) -> None:
     if not _can_manage_permissions(event):
         await remove_upload_user.finish("你没有权限管理上传权限（需要当前群群管/群主，或超级用户）！")
     
-    params = args.extract_plain_text().strip().split()
+    raw = (matched[0] or "").strip()
+    params = raw.split() if raw else []
     if len(params) != 2:
-        await remove_upload_user.finish("用法：@bot 移除上传用户 <群号> <用户ID>")
+        await remove_upload_user.finish("用法：移除上传用户 <群号> <用户ID>")
     
     try:
         gid = int(params[0])
