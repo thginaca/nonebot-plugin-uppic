@@ -4,14 +4,25 @@ from typing import Optional, Callable
 
 from fastapi.staticfiles import StaticFiles
 from fastapi import UploadFile, File, Form, Request, Depends
-from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
-from starlette.responses import JSONResponse
+from starlette.responses import HTMLResponse, JSONResponse, RedirectResponse
 from pydantic import BaseModel
 
 from nonebot.drivers.fastapi import Driver
 
 # 全局 token 引用，由 init_app_config 设置
 _web_token: Optional[str] = None
+
+# 登录成功后种下的会话 Cookie（浏览器关闭即失效）
+_COOKIE_NAME = "uppic_token"
+
+
+def _extract_token(request: Request) -> Optional[str]:
+    """按优先级提取 token：query 参数 → X-Uppic-Token 头 → 会话 Cookie"""
+    return (
+        request.query_params.get("token")
+        or request.headers.get("X-Uppic-Token")
+        or request.cookies.get(_COOKIE_NAME)
+    )
 
 
 def _verify_web_token(request: Request) -> Optional[JSONResponse]:
@@ -23,12 +34,10 @@ def _verify_web_token(request: Request) -> Optional[JSONResponse]:
     if _web_token is None:
         return None
 
-    token = request.query_params.get("token") or request.headers.get("X-Uppic-Token")
-
-    if token != _web_token:
+    if _extract_token(request) != _web_token:
         return JSONResponse(
             status_code=401,
-            content={"success": False, "message": "Unauthorized: 请携带正确的 ?token=xxx 参数访问"},
+            content={"success": False, "message": "Unauthorized: 请先打开 /uppic/ 输入访问令牌登录"},
         )
     return None
 
@@ -67,12 +76,11 @@ def register_route(driver: Driver, uppic_public_path: Path, uppic_img_path: Path
     app = driver.server_app
 
     # ===== Token 校验包装器 =====
-    # 配了 UPPIC_WEB_TOKEN 时，所有 /uppic/* 请求都会先过 _verify_web_token
+    # 配了 UPPIC_WEB_TOKEN 时，所有 /uppic/api/* 请求都会先过 _verify_web_token
     def _check(request: Request):
-        resp = _verify_web_token(request)
-        if resp is not None:
+        if _verify_web_token(request) is not None:
             from fastapi import HTTPException
-            raise HTTPException(status_code=resp.status_code, detail=resp.body.decode())
+            raise HTTPException(status_code=401, detail="未授权：请先打开 /uppic/ 输入访问令牌登录")
 
     # 先注册 API 路由（否则会被 /uppic mount 拦截返回 405）
     @app.post("/uppic/api/delete", dependencies=[Depends(_check)])
@@ -217,6 +225,53 @@ def register_route(driver: Driver, uppic_public_path: Path, uppic_img_path: Path
         except Exception as e:
             return {"success": False, "message": f"上传失败: {e}"}
 
+    # ===== 登录入口：校验 token 后种会话 Cookie =====
+    def _login_page(error: str = "") -> str:
+        err_html = f'<p class="err">{error}</p>' if error else ""
+        return f"""<!DOCTYPE html>
+<html lang="zh"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>图片库 - 登录</title>
+<style>
+body{{font-family:sans-serif;background:#f5f5f5;display:flex;justify-content:center;align-items:center;min-height:100vh;margin:0}}
+.card{{background:#fff;border-radius:8px;padding:32px;box-shadow:0 2px 8px rgba(0,0,0,.12);width:300px}}
+h3{{margin:0 0 16px;font-weight:normal}}
+input{{width:100%;padding:8px;box-sizing:border-box;border:1px solid #ccc;border-radius:4px;margin-bottom:12px}}
+button{{width:100%;padding:8px;background:#4a90d9;color:#fff;border:0;border-radius:4px;cursor:pointer}}
+.err{{color:#d33;font-size:13px;margin:-4px 0 12px}}
+</style></head><body>
+<form class="card" method="post" action="/uppic/api/login">
+<h3>图片库访问验证</h3>{err_html}
+<input type="password" name="token" placeholder="请输入访问令牌" autofocus>
+<button type="submit">登录</button>
+</form></body></html>"""
+
+    def _do_login(token: Optional[str]):
+        if _web_token is None:
+            return RedirectResponse("/uppic/", status_code=302)
+        if token and token == _web_token:
+            resp = RedirectResponse("/uppic/", status_code=302)
+            resp.set_cookie(
+                _COOKIE_NAME, token,
+                httponly=True, samesite="lax", path="/uppic",
+            )
+            return resp
+        return HTMLResponse(_login_page("令牌不正确，请重试"), status_code=401)
+
+    @app.get("/uppic/api/login")
+    async def web_login_get(request: Request):
+        # 未配置 token 时也提供入口，直接跳转
+        if _web_token is None:
+            return RedirectResponse("/uppic/", status_code=302)
+        token = request.query_params.get("token")
+        if token is None:
+            return HTMLResponse(_login_page())
+        return _do_login(token)
+
+    @app.post("/uppic/api/login")
+    async def web_login_post(token: str = Form(...)):
+        return _do_login(token)
+
     # ===== 挂载静态文件 + 统一 token 校验 =====
     # 主 app 已 start，不能 add_middleware → 改为把 StaticFiles 包成带 middleware 的子应用再 mount
     import logging
@@ -226,17 +281,24 @@ def register_route(driver: Driver, uppic_public_path: Path, uppic_img_path: Path
     html_path = str(uppic_public_path.resolve())
 
     if _web_token is not None:
-        _log.info(f"[Web] _web_token={_web_token!r}，用子应用 middleware 方案")
+        _log.info("[Web] 已配置 UPPIC_WEB_TOKEN，启用 Cookie 登录 + 子应用 middleware 方案")
         from starlette.applications import Starlette as _Starlette
         from starlette.middleware.base import BaseHTTPMiddleware
 
         class _TokenMiddleware(BaseHTTPMiddleware):
             async def dispatch(self, request: Request, call_next):
-                token = request.query_params.get("token") or request.headers.get("X-Uppic-Token")
-                if token != _web_token:
-                    _log.info(f"[Web] 子应用 middleware 拦截：path={request.url.path} token={token!r}")
-                    return JSONResponse(status_code=401, content={"success": False, "message": "Unauthorized: 请携带正确的 ?token=xxx 参数访问"})
-                return await call_next(request)
+                token = _extract_token(request)
+                if token == _web_token:
+                    return await call_next(request)
+                # 浏览器直接访问页面 → 返回登录页；图片/接口等 → 返回 401 JSON
+                accept = request.headers.get("accept", "")
+                path = request.url.path
+                if "text/html" in accept and (path.endswith("/") or path.endswith(".html")):
+                    return HTMLResponse(_login_page(), status_code=401)
+                return JSONResponse(
+                    status_code=401,
+                    content={"success": False, "message": "Unauthorized: 请先打开 /uppic/ 输入访问令牌登录"},
+                )
 
         # 子应用 1：/uppic/img（原图）
         img_sub = _Starlette()

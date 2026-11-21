@@ -455,13 +455,11 @@ def web_app_init(web_driver: Driver):
     # 4. 初始化 API 配置
     init_app_config_fn = getattr(_module, "init_app_config", None)
     if init_app_config_fn:
-        logger.info(f"[Web] 传给 init_app_config 的 web_token={uppic_web_token!r}")
         init_app_config_fn(uppic_img_path, uppic_super_users, connection, uppic_oss_no_upload_list, regenerate_web_site, _recent_sent, delete_folder_cleanup, upload_image_callback, web_token=uppic_web_token)
         logger.info("[Web] init_app_config 完成")
 
     # 5. 注册路由
     register_route = getattr(_module, "register_route")
-    logger.info(f"[Web] register_route 前 uppic_web_token={uppic_web_token!r}")
     register_route(web_driver, uppic_path / 'public', uppic_img_path)
     logger.info("[Web] register_route 完成, /uppic/ 已挂载")
 

@@ -175,15 +175,15 @@ cd /home/ubuntu/mybot/my_bot && nb run
 - 对比：`上传权限` 命令在指定其他群号时已正确要求超管（L1106），这两个命令漏掉了同样的检查
 - 建议：当 `gid != event.group_id` 时强制要求 `_is_super_user(event.user_id)`，与 `上传权限` 逻辑对齐
 
-## 🟡 MEDIUM-1 Web Token 明文写入日志
+## ✅ MEDIUM-1 Web Token 明文写入日志（已修复）
 
-- 位置（4 处）：
+- 原位置（4 处）：
   - `__init__.py` L458：`logger.info(f"[Web] 传给 init_app_config 的 web_token={uppic_web_token!r}")`
   - `__init__.py` L464：`logger.info(f"[Web] register_route 前 uppic_web_token={uppic_web_token!r}")`
   - `drivers/fastapi.py` L229：`_log.info(f"[Web] _web_token={_web_token!r}，用子应用 middleware 方案")`
   - `drivers/fastapi.py` L237：`_log.info(f"[Web] 子应用 middleware 拦截：... token={token!r}")`
 - 风险：日志被查看（运维、日志文件泄露）即可拿到 token，绕过 Web 端全部鉴权，执行删除/上传等高危操作
-- 建议：脱敏打印（如只显示前后 3 位 + 长度），或 INFO 级别不打印原文；L237 请求级日志还会把每次请求携带的 token 记下来，建议降为 DEBUG 且脱敏
+- 处理：4 处明文 token 日志已全部删除，仅保留不含敏感信息的状态日志
 
 ## 🟡 MEDIUM-2 存储型 XSS：静态 HTML 生成未转义目录名/文件名
 
@@ -195,7 +195,7 @@ cd /home/ubuntu/mybot/my_bot && nb run
 - 影响：管理员打开 `/uppic/` 图片墙时触发 XSS，可窃取 Web Token、以管理员身份调用删除/上传 API
 - 建议：目录名/文件名拼入 HTML 前做 HTML 实体转义（`< > & " '`），拼入 JS 字符串前做 JS 转义
 
-## 🟡 MEDIUM-3 配置 token 后，网页图片墙前端整体不可用
+## ✅ MEDIUM-3 配置 token 后，网页图片墙前端整体不可用（已按方案 A 修复）
 
 - 位置：`web.py` 生成的页面 JS（图片 URL、删除/上传/删分类的 fetch 调用）
 - 问题：服务端要求 token 后，前端所有请求都不携带 token——页面 URL 里的 `?token=` 不会自动带给后续请求
@@ -215,15 +215,15 @@ cd /home/ubuntu/mybot/my_bot && nb run
 | **B. Basic Auth** | 服务端返回 401 + `WWW-Authenticate`，浏览器弹框输入一次后自动带 `Authorization` 头 | 零改动 | 浏览器原生弹框，但退出登录很麻烦（凭据缓存到关浏览器） | 中 |
 | **C. 前端 JS 拼 token** | 从 `location.search` 读 token，手动附加到每个 img src 和 fetch | 要改 web.py 生成的所有 JS | 能用，但每个 URL 都拖着 token | 差（token 进浏览器历史、图片 URL 进 access log） |
 
-**推荐 A 的实现草图**（改动集中在 `drivers/fastapi.py`，web.py 一行不用动）：
+**已实施方案 A**（改动全部在 `drivers/fastapi.py` + `__init__.py` 删日志，web.py 未动）：
 
-1. 新增登录入口 `GET /uppic/api/login?token=xxx`：校验通过后 302 跳回 `/uppic/`，并 `Set-Cookie: uppic_token=...; HttpOnly; SameSite=Lax; Path=/uppic`
-2. `_verify_web_token` 和 `_TokenMiddleware` 取 token 顺序改为：query → header → cookie
-3. （可选）middleware 对未登录的 HTML 请求直接返回一页密码输入框（提交到登录入口），替代裸 401 JSON，用户连手动拼 `?token=` 都省了
+1. 新增登录入口：`GET /uppic/api/login`（无 token 参数时显示登录表单页；带 `?token=` 兼容旧直链方式）+ `POST /uppic/api/login`（表单提交）→ 校验通过后 302 回 `/uppic/` 并 `Set-Cookie: uppic_token=...; HttpOnly; SameSite=Lax; Path=/uppic`（会话级，关浏览器失效）
+2. token 提取统一为 `_extract_token()`：query → `X-Uppic-Token` header → Cookie，`_verify_web_token`（API dependency）和 `_TokenMiddleware`（静态子应用）共用
+3. 未登录访问：HTML 页面请求返回登录表单页（401），图片/API 请求返回 401 JSON
+4. 配套修复：4 处 token 明文日志已删（MEDIUM-1）；`_check` 的 `HTTPException` detail 改为干净文案，不再出现「删除失败: undefined」
+5. 冒烟测试通过：未登录拦截 / 错误 token / 正确 token 种 Cookie / Cookie 后页面+图片+上传+删除全通 / `?token=` 与 header 方式兼容 / 不配 token 时公开访问，共 9 组场景
 
-**配套修复**（实施 A 时一并处理）：
-- MEDIUM-1 的 4 处 token 明文日志删除/脱敏（否则 Cookie 方案做得再好，日志里还是裸 token）
-- `_check` 里 `HTTPException(detail=resp.body.decode())` 导致前端弹「删除失败: undefined」，改为直接返回 JSONResponse 或规范 detail
+**使用方式**：直接打开 `http://IP:8080/uppic/` → 出现登录页 → 输入 token → 自动跳转图片墙，之后一切正常，无需在 URL 里带 token。
 
 ## 🟢 低风险 / 已有防护但值得注意
 
@@ -237,10 +237,10 @@ cd /home/ubuntu/mybot/my_bot && nb run
 ## 修复优先级
 
 1. **立即修复**：HIGH-1 跨群越权（`添加上传用户` / `移除上传用户`）
-2. **尽快修复**：MEDIUM-1 token 明文日志（4 处）
-3. **尽快修复**：MEDIUM-3 前端 token 传递（推荐 Cookie 会话方案，见上文）
-4. **计划修复**：MEDIUM-2 web.py HTML/JS 转义
-5. **可选改进**：低风险项表格中的防御性加固
+2. **计划修复**：MEDIUM-2 web.py HTML/JS 转义
+3. **可选改进**：低风险项表格中的防御性加固
+4. ~~MEDIUM-1 token 明文日志~~ ✅ 已修复
+5. ~~MEDIUM-3 前端 token 传递~~ ✅ 已修复（Cookie 会话方案）
 
 ---
 
